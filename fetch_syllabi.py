@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import sys
+import time
 from pathlib import Path
 
 from playwright.sync_api import (
@@ -228,7 +229,9 @@ def find_syllabus_candidates(context: BrowserContext) -> list[tuple[Locator, Pag
     return candidates
 
 
-def find_syllabus_locator(context: BrowserContext) -> tuple[Locator, Page]:
+def find_syllabus_locator(context: BrowserContext) -> tuple[Locator, Page] | None:
+    """Try to auto-detect the syllabus link. Returns None if it can't be found,
+    rather than raising -- the caller falls back to a manual-click capture."""
     candidates = find_syllabus_candidates(context)
 
     if not candidates:
@@ -241,7 +244,7 @@ def find_syllabus_locator(context: BrowserContext) -> tuple[Locator, Page]:
         candidates = find_syllabus_candidates(context)
 
     if not candidates:
-        raise SyllabusNotFound("No content item with 'syllabus' in its name was found.")
+        return None
     if len(candidates) == 1:
         return candidates[0]
 
@@ -259,7 +262,11 @@ def find_syllabus_locator(context: BrowserContext) -> tuple[Locator, Page]:
     return candidates[index]
 
 
-def download_from_click(page: Page, target: Locator) -> Download:
+def _from_download(download: Download) -> tuple[bytes, str]:
+    return Path(download.path()).read_bytes(), download.suggested_filename
+
+
+def download_from_click(page: Page, target: Locator) -> tuple[bytes, str]:
     """Click a content item and capture whatever download it produces.
 
     Handles three shapes Brightspace commonly uses: a direct download, a
@@ -268,7 +275,7 @@ def download_from_click(page: Page, target: Locator) -> Download:
     try:
         with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
             target.click()
-        return dl_info.value
+        return _from_download(dl_info.value)
     except PlaywrightTimeoutError:
         pass
 
@@ -277,23 +284,69 @@ def download_from_click(page: Page, target: Locator) -> Download:
     if download_button:
         with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
             download_button.click()
-        return dl_info.value
+        return _from_download(dl_info.value)
 
     raise SyllabusNotFound(
-        "Clicked the syllabus item but no download or Download button appeared. "
-        "You may need to download it manually this time."
+        "Clicked the syllabus item but no download or Download button appeared."
     )
 
 
-def save_download(download: Download, output_dir: Path, course_code: str) -> Path:
+def wait_for_manual_download(context: BrowserContext, timeout_s: int = 180) -> tuple[bytes, str]:
+    """Wait for the user to click a download link themselves, and capture the
+    result -- whether that's a real browser download, or a file that just
+    opens in a new tab (e.g. Chrome's built-in PDF viewer, which never fires
+    a download event at all). This sidesteps having to correctly auto-detect
+    or auto-click the link.
+    """
+    found: dict[str, object] = {}
+
+    def remember_download(download: Download) -> None:
+        found.setdefault("download", download)
+
+    def remember_page(new_page: Page) -> None:
+        new_page.on("download", remember_download)
+        found.setdefault("page", new_page)
+
+    for existing_page in context.pages:
+        existing_page.on("download", remember_download)
+    context.on("page", remember_page)
+
+    print()
+    print(">>> Click the syllabus link/download button yourself now in the browser.")
+    print(f">>> Waiting up to {timeout_s} seconds for a download or a new tab to open...")
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if "download" in found:
+            return _from_download(found["download"])  # type: ignore[arg-type]
+        if "page" in found:
+            new_page: Page = found["page"]  # type: ignore[assignment]
+            try:
+                new_page.wait_for_load_state("load", timeout=10_000)
+            except PlaywrightTimeoutError:
+                pass
+            time.sleep(1)  # give a same-page download event a moment to win first
+            if "download" in found:
+                return _from_download(found["download"])  # type: ignore[arg-type]
+            # The file just opened directly in the new tab (e.g. a PDF viewer).
+            # Fetch that same URL with the browser's own cookies rather than
+            # relying on a download event that will never fire.
+            response = context.request.get(new_page.url)
+            filename = Path(new_page.url.split("?")[0]).name or "syllabus.pdf"
+            return response.body(), filename
+        time.sleep(0.5)
+
+    raise SyllabusNotFound("No download or new tab was detected after waiting for a manual click.")
+
+
+def save_bytes(data: bytes, suggested_filename: str, output_dir: Path, course_code: str) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    suggested = download.suggested_filename
-    suffix = Path(suggested).suffix or ""
+    suffix = Path(suggested_filename).suffix or ""
     safe_code = sanitize_course_code(course_code)
     target = output_dir / f"{safe_code}{suffix}"
     if target.exists():
         target = output_dir / f"{safe_code}_2{suffix}"
-    download.save_as(target)
+    target.write_bytes(data)
     return target
 
 
@@ -348,9 +401,21 @@ def process_course(page: Page, course_code: str, output_dir: Path) -> Path:
     open_course(page, course_code)
     ensure_on_content_page(page)
     expand_all_modules(page)
-    syllabus, syllabus_page = find_syllabus_locator(page.context)
-    download = download_from_click(syllabus_page, syllabus)
-    saved_path = save_download(download, output_dir, course_code)
+
+    found = find_syllabus_locator(page.context)
+    data: bytes
+    filename: str
+    if found is not None:
+        syllabus, syllabus_page = found
+        try:
+            data, filename = download_from_click(syllabus_page, syllabus)
+        except SyllabusNotFound:
+            data, filename = wait_for_manual_download(page.context)
+    else:
+        print(">>> Couldn't auto-detect a syllabus download on this page.")
+        data, filename = wait_for_manual_download(page.context)
+
+    saved_path = save_bytes(data, filename, output_dir, course_code)
     return ensure_pdf(saved_path)
 
 

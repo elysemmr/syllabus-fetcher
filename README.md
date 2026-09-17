@@ -61,10 +61,18 @@ code and converted to PDF if it wasn't one already (e.g. `Syllabi/CSE201.pdf`,
 ### Manual fallback
 
 Brightspace themes vary by school, so if a step can't be automated (course
-not found, no Content link, several items match "syllabus"), the script
-pauses and asks you to do that one step by hand in the open browser window,
-then press Enter in the terminal to let it continue. It still saves you from
-re-doing the repetitive per-course search-and-download by hand.
+not found, no Content link), the script pauses and asks you to do that one
+step by hand in the open browser window, then press Enter in the terminal to
+let it continue.
+
+If it still can't auto-detect or auto-click the actual syllabus link/file
+(e.g. it's buried inside another page in a way the script doesn't recognize),
+it falls back to just waiting for **you** to click it yourself in the browser
+-- it'll capture whatever results, whether that's a real download or a file
+that opens directly in a new tab (like Chrome's built-in PDF viewer), and
+still handles the saving, naming, and PDF conversion automatically. This
+means you never have to manually "Save As" into the right folder with the
+right name yourself.
 
 ### Session reuse
 
