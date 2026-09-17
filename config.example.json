@@ -1,0 +1,11 @@
+{
+  "_comment": "Copy this file to config.json and fill in the values below. config.json is gitignored.",
+
+  "base_url": "REPLACE-WITH-YOUR-MYFIRE-OR-BRIGHTSPACE-LOGIN-URL",
+
+  "_home_url_fragment_comment": "A substring of the URL Brightspace redirects you to once SSO login succeeds (e.g. '/d2l/home'). Used to detect that login is complete.",
+  "home_url_fragment": "/d2l/home",
+
+  "_output_dir_comment": "Where downloaded syllabi land. Defaults to ~/Desktop/Syllabi if omitted or null.",
+  "output_dir": null
+}
