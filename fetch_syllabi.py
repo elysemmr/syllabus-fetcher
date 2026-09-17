@@ -205,29 +205,53 @@ def expand_all_modules(page: Page) -> None:
             pass
 
 
-def find_syllabus_locator(page: Page) -> Locator:
-    matches = page.get_by_text(SYLLABUS_RE)
-    count = matches.count()
-    if count == 0:
-        raise SyllabusNotFound("No content item with 'syllabus' in its name was found.")
-    if count == 1:
-        return matches.first
+def find_syllabus_candidates(page: Page) -> list[Locator]:
+    """Find everything matching 'syllabus' on the page, including inside iframes.
 
-    LOG.info("Found %d items matching 'syllabus':", count)
-    options = []
-    for i in range(count):
-        text = matches.nth(i).inner_text().strip()
-        options.append(text)
-        print(f"  [{i}] {text}")
+    Brightspace often renders a clicked-into topic (e.g. a "Course Resources"
+    page) inside an embedded frame rather than the top-level page, so a
+    plain page.get_by_text() alone would miss a syllabus link living there.
+    """
+    candidates: list[Locator] = []
+    for frame in page.frames:
+        try:
+            matches = frame.get_by_text(SYLLABUS_RE)
+            count = matches.count()
+        except Exception:  # noqa: BLE001 - a detached/cross-origin frame can throw
+            continue
+        candidates.extend(matches.nth(i) for i in range(count))
+    return candidates
+
+
+def find_syllabus_locator(page: Page) -> Locator:
+    candidates = find_syllabus_candidates(page)
+
+    if not candidates:
+        print()
+        print(">>> Nothing named 'syllabus' was found directly in the content list.")
+        print(">>> If the syllabus is actually a link inside another page (e.g. a")
+        print(">>> 'Course Resources' or 'Course Materials' page), click into that")
+        print(">>> page now in the open browser window so the syllabus link is visible.")
+        input(">>> Press Enter here once you can see a 'syllabus' link (or Ctrl+C to abort): ")
+        candidates = find_syllabus_candidates(page)
+
+    if not candidates:
+        raise SyllabusNotFound("No content item with 'syllabus' in its name was found.")
+    if len(candidates) == 1:
+        return candidates[0]
+
+    LOG.info("Found %d items matching 'syllabus':", len(candidates))
+    for i, candidate in enumerate(candidates):
+        print(f"  [{i}] {candidate.inner_text().strip()}")
     choice = input("Which one is the syllabus? Enter a number: ").strip()
     try:
         index = int(choice)
-        if not (0 <= index < count):
+        if not (0 <= index < len(candidates)):
             raise ValueError
     except ValueError:
         LOG.error("Invalid selection, defaulting to the first match.")
         index = 0
-    return matches.nth(index)
+    return candidates[index]
 
 
 def download_from_click(page: Page, target: Locator) -> Download:
