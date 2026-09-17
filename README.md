@@ -47,7 +47,11 @@ python fetch_syllabi.py --courses-file courses.txt
 ```
 
 A Chrome window opens. Log in via SSO (the script waits up to 5 minutes).
-After that, for each course code the script tries to:
+After that, for each course code the script first tries Brightspace's own
+REST API (the same one its web UI is built on) to look up the course and
+find the syllabus as structured data -- no clicking at all when this works.
+If the API isn't reachable or doesn't turn anything up, it falls back to
+driving the browser UI itself:
 
 1. Find and open the course automatically via Brightspace's course
    selector/search.

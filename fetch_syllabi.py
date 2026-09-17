@@ -2,9 +2,11 @@
 """Download course syllabi from Brightspace (D2L) for a batch of course codes.
 
 Login happens through a real, visible browser window so you can complete your
-school's SSO flow (including MFA) by hand; this script only automates the
-repetitive part -- finding "syllabus" in each course's content tree and
-saving it.
+school's SSO flow (including MFA) by hand. After that, the script tries to
+find and download each syllabus automatically via Brightspace's own REST
+API (no clicking needed); if that doesn't pan out for some reason, it falls
+back to searching the content tree and clicking through the UI itself, and
+as a last resort, asks you to click the link so it can capture the result.
 
 Usage:
     python fetch_syllabi.py --courses CSE201,MATH150,ENGL101
@@ -23,6 +25,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import unquote
 
 from playwright.sync_api import (
     BrowserContext,
@@ -86,6 +89,174 @@ class CourseNotFound(Exception):
 
 class SyllabusNotFound(Exception):
     pass
+
+
+# --- Brightspace REST API auto-detection ------------------------------------
+#
+# Brightspace's own web UI is built by calling its documented REST API
+# (https://docs.valence.desire2learn.com/), and that API is reachable with
+# the same session cookies the logged-in browser already has. Querying it
+# directly for the course's content structure and the syllabus file is far
+# more reliable than guessing at rendered HTML/CSS, and needs zero clicking.
+# Everything below is best-effort: if anything about it doesn't match this
+# Brightspace instance, it returns None/raises nothing, and the caller falls
+# back to the click-based flow further down in this file.
+
+def get_api_versions(context: BrowserContext, base_url: str) -> dict[str, str]:
+    """Look up the latest supported version of each Brightspace API product
+    (e.g. "le", "lp"), needed to build correct API URLs."""
+    versions: dict[str, str] = {}
+    try:
+        resp = context.request.get(f"{base_url.rstrip('/')}/d2l/api/versions/")
+        if resp.status != 200:
+            return versions
+        for entry in resp.json():
+            code = entry.get("ProductCode")
+            latest = entry.get("LatestVersion")
+            if code and latest:
+                versions[code] = latest
+    except Exception:  # noqa: BLE001 - best-effort
+        LOG.debug("Couldn't fetch Brightspace API versions.", exc_info=True)
+    return versions
+
+
+def find_org_unit_id(context: BrowserContext, base_url: str, lp_version: str, course_code: str) -> int | None:
+    """Look up the numeric org unit ID Brightspace uses internally for a
+    course, by matching course_code against the logged-in user's own
+    enrollments (so this never depends on the course-selector UI)."""
+    bookmark: str | None = None
+    needle = course_code.lower()
+    for _ in range(20):  # safety cap on pagination
+        params = {"orgUnitTypeId": "3"}
+        if bookmark:
+            params["bookmark"] = bookmark
+        try:
+            resp = context.request.get(
+                f"{base_url.rstrip('/')}/d2l/api/lp/{lp_version}/enrollments/myenrollments/",
+                params=params,
+            )
+            if resp.status != 200:
+                return None
+            data = resp.json()
+        except Exception:  # noqa: BLE001 - best-effort
+            LOG.debug("Enrollment lookup failed.", exc_info=True)
+            return None
+
+        for item in data.get("Items", []):
+            org_unit = item.get("OrgUnit") or {}
+            code = (org_unit.get("Code") or "").lower()
+            name = (org_unit.get("Name") or "").lower()
+            if not code and not name:
+                continue
+            if needle in code or needle in name or code in needle or (name and name in needle):
+                return org_unit.get("Id")
+
+        paging = data.get("PagingInfo") or {}
+        if not paging.get("HasMoreItems"):
+            return None
+        bookmark = paging.get("Bookmark")
+    return None
+
+
+def _filename_from_response(resp, fallback_url: str) -> str:
+    content_disposition = resp.headers.get("content-disposition", "")
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', content_disposition)
+    if match:
+        return unquote(match.group(1))
+    return Path(fallback_url.split("?")[0]).name or "syllabus.pdf"
+
+
+def _iter_toc_topics(modules: list[dict]):
+    for module in modules or []:
+        yield from module.get("Topics", []) or []
+        yield from _iter_toc_topics(module.get("Modules", []) or [])
+
+
+def find_syllabus_via_api(
+    context: BrowserContext, base_url: str, le_version: str, org_unit_id: int
+) -> tuple[bytes, str] | None:
+    try:
+        resp = context.request.get(
+            f"{base_url.rstrip('/')}/d2l/api/le/{le_version}/{org_unit_id}/content/toc"
+        )
+        if resp.status != 200:
+            return None
+        topics = list(_iter_toc_topics(resp.json().get("Modules", []) or []))
+    except Exception:  # noqa: BLE001 - best-effort
+        LOG.debug("Content TOC lookup failed.", exc_info=True)
+        return None
+
+    # Fast path: a topic whose own title says "syllabus" (an uploaded file).
+    for topic in topics:
+        if SYLLABUS_RE.search(topic.get("Title") or ""):
+            result = _fetch_topic_file(context, base_url, le_version, org_unit_id, topic)
+            if result:
+                return result
+
+    # Slower path: a syllabus link buried inside an HTML content page.
+    for topic in topics:
+        type_id = (topic.get("TypeIdentifier") or "").lower()
+        url = topic.get("Url")
+        if not url or ("html" not in type_id and type_id != "link"):
+            continue
+        try:
+            full_url = url if url.startswith("http") else f"{base_url.rstrip('/')}{url}"
+            page_resp = context.request.get(full_url)
+            if page_resp.status != 200:
+                continue
+            html = page_resp.text()
+        except Exception:  # noqa: BLE001 - best-effort
+            continue
+        match = re.search(r'<a[^>]+href="([^"]+)"[^>]*>[^<]*syllabus[^<]*</a>', html, re.IGNORECASE)
+        if not match:
+            continue
+        href = match.group(1)
+        try:
+            file_url = href if href.startswith("http") else f"{base_url.rstrip('/')}{href}"
+            file_resp = context.request.get(file_url)
+            if file_resp.status == 200:
+                return file_resp.body(), _filename_from_response(file_resp, file_url)
+        except Exception:  # noqa: BLE001 - best-effort
+            continue
+
+    return None
+
+
+def _fetch_topic_file(
+    context: BrowserContext, base_url: str, le_version: str, org_unit_id: int, topic: dict
+) -> tuple[bytes, str] | None:
+    topic_id = topic.get("Id")
+    if topic_id is None:
+        return None
+    try:
+        resp = context.request.get(
+            f"{base_url.rstrip('/')}/d2l/api/le/{le_version}/{org_unit_id}/content/topics/{topic_id}/file"
+        )
+        if resp.status != 200:
+            return None
+        return resp.body(), _filename_from_response(resp, topic.get("Title") or "syllabus.pdf")
+    except Exception:  # noqa: BLE001 - best-effort
+        return None
+
+
+def try_api_auto_download(
+    context: BrowserContext, base_url: str, api_versions: dict[str, str], course_code: str
+) -> tuple[bytes, str] | None:
+    """Best-effort end-to-end attempt via Brightspace's REST API, with no
+    browser clicking at all. Returns None (never raises) on any failure so
+    the caller can fall back to the click-based flow."""
+    lp_version = api_versions.get("lp")
+    le_version = api_versions.get("le")
+    if not lp_version or not le_version:
+        return None
+    try:
+        org_unit_id = find_org_unit_id(context, base_url, lp_version, course_code)
+        if org_unit_id is None:
+            return None
+        return find_syllabus_via_api(context, base_url, le_version, org_unit_id)
+    except Exception:  # noqa: BLE001 - this whole path is best-effort
+        LOG.debug("API auto-download attempt failed.", exc_info=True)
+        return None
 
 
 def load_config(path: Path) -> dict:
@@ -397,23 +568,31 @@ def ensure_pdf(path: Path) -> Path:
     return pdf_path
 
 
-def process_course(page: Page, course_code: str, output_dir: Path) -> Path:
-    open_course(page, course_code)
-    ensure_on_content_page(page)
-    expand_all_modules(page)
-
-    found = find_syllabus_locator(page.context)
+def process_course(
+    page: Page, course_code: str, output_dir: Path, base_url: str, api_versions: dict[str, str]
+) -> Path:
     data: bytes
     filename: str
-    if found is not None:
-        syllabus, syllabus_page = found
-        try:
-            data, filename = download_from_click(syllabus_page, syllabus)
-        except SyllabusNotFound:
-            data, filename = wait_for_manual_download(page.context)
+
+    api_result = try_api_auto_download(page.context, base_url, api_versions, course_code)
+    if api_result is not None:
+        LOG.info("Found and downloaded the syllabus via Brightspace's API -- no clicking needed.")
+        data, filename = api_result
     else:
-        print(">>> Couldn't auto-detect a syllabus download on this page.")
-        data, filename = wait_for_manual_download(page.context)
+        open_course(page, course_code)
+        ensure_on_content_page(page)
+        expand_all_modules(page)
+
+        found = find_syllabus_locator(page.context)
+        if found is not None:
+            syllabus, syllabus_page = found
+            try:
+                data, filename = download_from_click(syllabus_page, syllabus)
+            except SyllabusNotFound:
+                data, filename = wait_for_manual_download(page.context)
+        else:
+            print(">>> Couldn't auto-detect a syllabus download on this page.")
+            data, filename = wait_for_manual_download(page.context)
 
     saved_path = save_bytes(data, filename, output_dir, course_code)
     return ensure_pdf(saved_path)
@@ -468,10 +647,16 @@ def main(argv: list[str] | None = None) -> int:
         if home_url_fragment not in page.url:
             wait_for_login(page, home_url_fragment)
 
+        api_versions = get_api_versions(context, config["base_url"])
+        if api_versions:
+            LOG.info("Brightspace API detected -- will try fully automatic lookup for each course.")
+        else:
+            LOG.info("Brightspace API not reachable -- falling back to click-based automation.")
+
         for course_code in course_codes:
             LOG.info("--- %s ---", course_code)
             try:
-                saved_path = process_course(page, course_code, output_dir)
+                saved_path = process_course(page, course_code, output_dir, config["base_url"], api_versions)
                 LOG.info("Saved %s -> %s", course_code, saved_path)
                 results[course_code] = f"OK: {saved_path}"
             except (CourseNotFound, SyllabusNotFound) as exc:
