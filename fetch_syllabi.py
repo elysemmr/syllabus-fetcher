@@ -55,6 +55,7 @@ WORD_CONVERTIBLE_EXTENSIONS = {".doc", ".docx", ".rtf", ".odt"}
 # different markup, tweak this list -- everything else in the script is
 # selector-agnostic and falls back to asking you to click manually.
 COURSE_SELECTOR_BUTTON_CANDIDATES = [
+    'button[aria-label^="Select a course"]',  # confirmed via inspecting MyFire
     '[title="Select a course"]',
     'button:has-text("Select a course")',
     'd2l-navigation-main-header >> [title="Course Selector"]',
