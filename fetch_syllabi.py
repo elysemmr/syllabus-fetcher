@@ -60,6 +60,7 @@ COURSE_SELECTOR_BUTTON_CANDIDATES = [
     'd2l-navigation-main-header >> [title="Course Selector"]',
 ]
 COURSE_SEARCH_INPUT_CANDIDATES = [
+    'input[placeholder="Search for a course"]',  # confirmed exact text on MyFire's course selector
     'input[type="search"]',
     'input[placeholder*="ourse" i]',
 ]
