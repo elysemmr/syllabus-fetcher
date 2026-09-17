@@ -1,10 +1,10 @@
 # syllabus-fetcher
 
 Downloads course syllabi from MyFire/Brightspace (D2L) for a batch of course
-codes. Login goes through a real, visible browser window so you do your
-school's SSO (and any MFA) by hand; the script automates the repetitive
-part: searching each course's content tree for something named "syllabus"
-and saving it into one flat folder, named by course code.
+codes, always as PDF. Login goes through a real, visible browser window so
+you do your school's SSO (and any MFA) by hand; the script automates the
+repetitive part: searching each course's content tree for something named
+"syllabus" and saving it into one flat folder, named by course code.
 
 **Run this on your own machine, not in a headless/remote environment** — the
 login step needs a real window you can click through.
@@ -18,6 +18,11 @@ pip install -r requirements.txt
 playwright install chromium
 cp config.example.json config.json
 ```
+
+Also install [LibreOffice](https://www.libreoffice.org/download/download/) and
+make sure its `soffice` command is on your PATH. It's used to convert
+non-PDF syllabi (Word docs, etc.) to PDF; if it's missing, the script still
+downloads the file but leaves it in its original format and warns you.
 
 Edit `config.json`:
 
@@ -46,7 +51,8 @@ After that, for each course code the script tries to:
 3. Find an item with "syllabus" in the name and download it.
 
 Every downloaded file is saved flat into the output folder, named by course
-code (e.g. `Syllabi/CSE201.pdf`, `Syllabi/MATH150.docx`).
+code and converted to PDF if it wasn't one already (e.g. `Syllabi/CSE201.pdf`,
+`Syllabi/MATH150.pdf`) — see the LibreOffice note above.
 
 ### Manual fallback
 
@@ -69,6 +75,20 @@ near the top of the file — the rest of the script doesn't need to change.
 
 ## Claude Code permissions
 
-This project's `.claude/settings.json` scopes Claude Code's write access to
-this project directory and the default `~/Desktop/Syllabi` output folder, so
-routine edits here don't prompt for approval on every action.
+To scope Claude Code's write access to this project directory and the
+default `~/Desktop/Syllabi` output folder (so it doesn't prompt for approval
+on every action here), add a `.claude/settings.json` with:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Write(**)",
+      "Edit(**)",
+      "Write(~/Desktop/Syllabi/**)",
+      "Edit(~/Desktop/Syllabi/**)",
+      "Bash(mkdir -p ~/Desktop/Syllabi*)"
+    ]
+  }
+}
+```
