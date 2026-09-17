@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 from playwright.sync_api import (
+    BrowserContext,
     Download,
     Locator,
     Page,
@@ -205,35 +206,37 @@ def expand_all_modules(page: Page) -> None:
             pass
 
 
-def find_syllabus_candidates(page: Page) -> list[Locator]:
-    """Find everything matching 'syllabus' on the page, including inside iframes.
+def find_syllabus_candidates(context: BrowserContext) -> list[tuple[Locator, Page]]:
+    """Find everything matching 'syllabus' across every open tab and iframe.
 
-    Brightspace often renders a clicked-into topic (e.g. a "Course Resources"
-    page) inside an embedded frame rather than the top-level page, so a
-    plain page.get_by_text() alone would miss a syllabus link living there.
+    Brightspace sometimes renders a clicked-into topic (e.g. a "Course
+    Resources" or "Get Started" page) inside an embedded iframe, and
+    sometimes opens it in a whole new browser tab instead. Checking only the
+    original page/frame would miss a syllabus link living in either place.
     """
-    candidates: list[Locator] = []
-    for frame in page.frames:
-        try:
-            matches = frame.get_by_text(SYLLABUS_RE)
-            count = matches.count()
-        except Exception:  # noqa: BLE001 - a detached/cross-origin frame can throw
-            continue
-        candidates.extend(matches.nth(i) for i in range(count))
+    candidates: list[tuple[Locator, Page]] = []
+    for page in context.pages:
+        for frame in page.frames:
+            try:
+                matches = frame.get_by_text(SYLLABUS_RE)
+                count = matches.count()
+            except Exception:  # noqa: BLE001 - a detached/cross-origin frame can throw
+                continue
+            candidates.extend((matches.nth(i), page) for i in range(count))
     return candidates
 
 
-def find_syllabus_locator(page: Page) -> Locator:
-    candidates = find_syllabus_candidates(page)
+def find_syllabus_locator(context: BrowserContext) -> tuple[Locator, Page]:
+    candidates = find_syllabus_candidates(context)
 
     if not candidates:
         print()
         print(">>> Nothing named 'syllabus' was found directly in the content list.")
         print(">>> If the syllabus is actually a link inside another page (e.g. a")
-        print(">>> 'Course Resources' or 'Course Materials' page), click into that")
-        print(">>> page now in the open browser window so the syllabus link is visible.")
+        print(">>> 'Course Resources' or 'Get Started' page), click into that page")
+        print(">>> now in the browser -- a new tab is fine, the script checks those too.")
         input(">>> Press Enter here once you can see a 'syllabus' link (or Ctrl+C to abort): ")
-        candidates = find_syllabus_candidates(page)
+        candidates = find_syllabus_candidates(context)
 
     if not candidates:
         raise SyllabusNotFound("No content item with 'syllabus' in its name was found.")
@@ -241,7 +244,7 @@ def find_syllabus_locator(page: Page) -> Locator:
         return candidates[0]
 
     LOG.info("Found %d items matching 'syllabus':", len(candidates))
-    for i, candidate in enumerate(candidates):
+    for i, (candidate, _page) in enumerate(candidates):
         print(f"  [{i}] {candidate.inner_text().strip()}")
     choice = input("Which one is the syllabus? Enter a number: ").strip()
     try:
@@ -343,8 +346,8 @@ def process_course(page: Page, course_code: str, output_dir: Path) -> Path:
     open_course(page, course_code)
     ensure_on_content_page(page)
     expand_all_modules(page)
-    syllabus = find_syllabus_locator(page)
-    download = download_from_click(page, syllabus)
+    syllabus, syllabus_page = find_syllabus_locator(page.context)
+    download = download_from_click(syllabus_page, syllabus)
     saved_path = save_download(download, output_dir, course_code)
     return ensure_pdf(saved_path)
 
