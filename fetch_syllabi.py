@@ -20,8 +20,6 @@ import argparse
 import json
 import logging
 import re
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -43,14 +41,13 @@ SESSION_DIR = PROJECT_DIR / ".auth" / "browser-profile"
 LOGIN_TIMEOUT_MS = 5 * 60 * 1000  # generous window to click through SSO/MFA by hand
 NAV_TIMEOUT_MS = 30_000
 DOWNLOAD_TIMEOUT_MS = 20_000
-PDF_CONVERT_TIMEOUT_S = 60
 
 SYLLABUS_RE = re.compile(r"syllabus", re.IGNORECASE)
 
-# Extensions LibreOffice can convert to PDF. Anything else downloaded (an
-# image, a zip, ...) is left as-is with a warning, since it isn't really a
-# "document" to convert.
-CONVERTIBLE_EXTENSIONS = {".doc", ".docx", ".rtf", ".odt", ".txt", ".ppt", ".pptx", ".xls", ".xlsx"}
+# Extensions Word can open and convert to PDF via docx2pdf. Anything else
+# downloaded (a spreadsheet, an image, a zip, ...) is left as-is with a
+# warning.
+WORD_CONVERTIBLE_EXTENSIONS = {".doc", ".docx", ".rtf", ".odt"}
 
 # Brightspace/D2L instances are re-themed per school, so these selectors are
 # best-effort defaults, tried in order. If your MyFire/Brightspace theme uses
@@ -274,40 +271,42 @@ def save_download(download: Download, output_dir: Path, course_code: str) -> Pat
 def ensure_pdf(path: Path) -> Path:
     """Convert a downloaded file to PDF in place, if it isn't one already.
 
-    Uses LibreOffice's headless converter (the `soffice` binary), since it's
-    free, cross-platform, and doesn't require MS Office to be installed.
+    Drives Microsoft Word itself (via the docx2pdf package) to do the
+    conversion, so no extra software beyond Word is required. Windows and
+    macOS only, and Word must be installed.
     """
     if path.suffix.lower() == ".pdf":
         return path
 
-    if path.suffix.lower() not in CONVERTIBLE_EXTENSIONS:
+    if path.suffix.lower() not in WORD_CONVERTIBLE_EXTENSIONS:
         LOG.warning(
-            "%s isn't a document LibreOffice can convert to PDF; leaving it as-is.",
-            path.name,
-        )
-        return path
-
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    if not soffice:
-        LOG.warning(
-            "LibreOffice ('soffice') isn't installed, so %s couldn't be converted "
-            "to PDF. Install LibreOffice and re-run, or convert it by hand.",
+            "%s isn't a Word-openable document; leaving it as-is.",
             path.name,
         )
         return path
 
     try:
-        subprocess.run(
-            [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(path.parent), str(path)],
-            check=True,
-            capture_output=True,
-            timeout=PDF_CONVERT_TIMEOUT_S,
+        from docx2pdf import convert
+    except ImportError:
+        LOG.warning(
+            "docx2pdf isn't installed (pip install docx2pdf), so %s couldn't be "
+            "converted to PDF.",
+            path.name,
         )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        LOG.warning("PDF conversion failed for %s: %s. Leaving original file.", path.name, exc)
         return path
 
     pdf_path = path.with_suffix(".pdf")
+    try:
+        convert(str(path), str(pdf_path))
+    except Exception as exc:  # noqa: BLE001 - docx2pdf raises platform-specific errors
+        LOG.warning(
+            "Word couldn't convert %s to PDF (%s). Make sure Microsoft Word is "
+            "installed and not blocked by a dialog box. Leaving original file.",
+            path.name,
+            exc,
+        )
+        return path
+
     if not pdf_path.exists():
         LOG.warning("Expected %s after conversion but it wasn't created; leaving original file.", pdf_path.name)
         return path

@@ -19,10 +19,11 @@ playwright install chromium
 cp config.example.json config.json
 ```
 
-Also install [LibreOffice](https://www.libreoffice.org/download/download/) and
-make sure its `soffice` command is on your PATH. It's used to convert
-non-PDF syllabi (Word docs, etc.) to PDF; if it's missing, the script still
-downloads the file but leaves it in its original format and warns you.
+PDF conversion drives Microsoft Word itself (via the `docx2pdf` package
+already in requirements.txt), so no extra software to install — just make
+sure Word is installed and not blocked by a dialog box when the script runs.
+Windows and macOS only. If Word isn't available, the script still downloads
+the file but leaves it in its original format and warns you.
 
 Edit `config.json`:
 
@@ -52,7 +53,7 @@ After that, for each course code the script tries to:
 
 Every downloaded file is saved flat into the output folder, named by course
 code and converted to PDF if it wasn't one already (e.g. `Syllabi/CSE201.pdf`,
-`Syllabi/MATH150.pdf`) — see the LibreOffice note above.
+`Syllabi/MATH150.pdf`) — see the Word/docx2pdf note above.
 
 ### Manual fallback
 
