@@ -363,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             str(SESSION_DIR),
+            channel="chrome",
             headless=args.headless,
             accept_downloads=True,
         )

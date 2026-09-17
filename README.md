@@ -15,9 +15,12 @@ login step needs a real window you can click through.
 python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-playwright install chromium
 cp config.example.json config.json
 ```
+
+The script drives your actual installed Google Chrome (via Playwright's
+`channel="chrome"`), not a separate downloaded browser, so make sure Chrome
+is installed and there's nothing else to fetch for it.
 
 PDF conversion drives Microsoft Word itself (via the `docx2pdf` package
 already in requirements.txt), so no extra software to install — just make
@@ -43,7 +46,7 @@ python fetch_syllabi.py --courses CSE201,MATH150,ENGL101
 python fetch_syllabi.py --courses-file courses.txt
 ```
 
-A Chromium window opens. Log in via SSO (the script waits up to 5 minutes).
+A Chrome window opens. Log in via SSO (the script waits up to 5 minutes).
 After that, for each course code the script tries to:
 
 1. Find and open the course automatically via Brightspace's course
