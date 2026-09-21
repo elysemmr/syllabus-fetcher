@@ -29,6 +29,7 @@ import re
 import sys
 import time
 from collections.abc import Callable
+from html import unescape
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -222,6 +223,38 @@ def _filename_from_response(resp, fallback_url: str) -> str:
     return Path(fallback_url.split("?")[0]).name or "syllabus.pdf"
 
 
+SYLLABUS_LINK_RE = re.compile(r'<a[^>]+href="([^"]+)"[^>]*>[^<]*syllabus[^<]*</a>', re.IGNORECASE)
+
+
+def _iter_module_descriptions(modules: list[dict], parents: tuple[str, ...] = ()):
+    """Yield (module path, description HTML) for every module that has a
+    description. A syllabus link is sometimes in a module's intro text
+    ("Review <a>Course Syllabus & Policies</a>") rather than in any topic."""
+    for module in modules or []:
+        path = parents + (module.get("Title") or "",)
+        description = module.get("Description")
+        html = description.get("Html") if isinstance(description, dict) else description
+        if isinstance(html, str) and html:
+            yield " > ".join(part for part in path if part), html
+        yield from _iter_module_descriptions(module.get("Modules", []) or [], path)
+
+
+def _download_syllabus_href(context: BrowserContext, base_url: str, href: str) -> tuple[bytes, str] | None:
+    """Download the file a syllabus link points at (relative or absolute)."""
+    href = unescape(href)
+    file_url = href if href.startswith("http") else f"{base_url.rstrip('/')}{href}"
+    try:
+        file_resp = context.request.get(file_url)
+        if file_resp.status == 200:
+            filename = _filename_from_response(file_resp, unquote(file_url))
+            LOG.debug("Downloaded syllabus %r (%d bytes) from %s", filename, len(file_resp.body()), file_url)
+            return file_resp.body(), filename
+        LOG.debug("Fetching syllabus file %r returned HTTP %d.", file_url, file_resp.status)
+    except Exception:  # noqa: BLE001 - best-effort
+        LOG.debug("Fetching syllabus file %r failed.", file_url, exc_info=True)
+    return None
+
+
 def _iter_toc_topics(modules: list[dict], parents: tuple[str, ...] = ()):
     """Yield every topic in the table of contents, each with a "ModulePath"
     like "Reference Information > Week 1" saying where it sits."""
@@ -248,7 +281,8 @@ def find_syllabus_via_api(
             LOG.debug("Content TOC lookup returned HTTP %d: %s", resp.status, resp.text()[:500])
             _search_failure_reason[org_unit_id] = f"its content table of contents returned HTTP {resp.status}"
             return None
-        topics = list(_iter_toc_topics(resp.json().get("Modules", []) or []))
+        modules = resp.json().get("Modules", []) or []
+        topics = list(_iter_toc_topics(modules))
     except Exception:  # noqa: BLE001 - best-effort
         LOG.debug("Content TOC lookup failed.", exc_info=True)
         _search_failure_reason[org_unit_id] = "its content table of contents couldn't be read"
@@ -296,6 +330,17 @@ def find_syllabus_via_api(
             LOG.debug("Fetching topic file for %r failed.", topic.get("Title"))
             undownloadable.append(topic.get("Title") or "")
 
+    # A syllabus link in a module's description, which is already in the TOC.
+    for module_path, description_html in _iter_module_descriptions(modules):
+        match = SYLLABUS_LINK_RE.search(description_html)
+        if not match:
+            continue
+        LOG.debug("Module %r's description links to a syllabus: %s", module_path, match.group(1))
+        result = _download_syllabus_href(context, base_url, match.group(1))
+        if result:
+            LOG.info("Syllabus is a link in the description of the module %r.", module_path)
+            return result
+
     # Slower path: a syllabus link buried inside a content page's body --
     # either an uploaded "File" topic (often an HTML page, like a "Course
     # Resources" checklist) or a "Link"/HTML topic reachable via its own Url.
@@ -335,7 +380,7 @@ def find_syllabus_via_api(
 
         if not html:
             continue
-        match = re.search(r'<a[^>]+href="([^"]+)"[^>]*>[^<]*syllabus[^<]*</a>', html, re.IGNORECASE)
+        match = SYLLABUS_LINK_RE.search(html)
         if not match:
             LOG.debug(
                 "No syllabus link found in topic %r (%d chars of HTML). "
@@ -345,22 +390,11 @@ def find_syllabus_via_api(
                 html[:300],
             )
             continue
-        href = match.group(1)
-        LOG.debug("Syllabus link found in topic %r: %s", topic.get("Title"), href)
-        try:
-            file_url = href if href.startswith("http") else f"{base_url.rstrip('/')}{href}"
-            file_resp = context.request.get(file_url)
-            if file_resp.status == 200:
-                filename = _filename_from_response(file_resp, file_url)
-                LOG.debug("Downloaded syllabus %r (%d bytes) from %s", filename, len(file_resp.body()), file_url)
-                LOG.info(
-                    "Syllabus is a link inside the topic %r (in %r).", topic.get("Title"), topic.get("ModulePath")
-                )
-                return file_resp.body(), filename
-            LOG.debug("Fetching syllabus file %r returned HTTP %d.", file_url, file_resp.status)
-        except Exception:  # noqa: BLE001 - best-effort
-            LOG.debug("Fetching syllabus file %r failed.", href, exc_info=True)
-            continue
+        LOG.debug("Syllabus link found in topic %r: %s", topic.get("Title"), match.group(1))
+        result = _download_syllabus_href(context, base_url, match.group(1))
+        if result:
+            LOG.info("Syllabus is a link inside the topic %r (in %r).", topic.get("Title"), topic.get("ModulePath"))
+            return result
 
     if undownloadable:
         _search_failure_reason[org_unit_id] = (
