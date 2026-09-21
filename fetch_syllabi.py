@@ -138,6 +138,81 @@ def extract_org_unit_id(page: Page) -> int | None:
     return int(match.group(1)) if match else None
 
 
+# (org unit id, code, name) for every course enrollment, fetched once per
+# run: the list can be tens of thousands of entries long, and Brightspace
+# ignores the `search` parameter on this endpoint, so it can only be paged.
+_enrollment_cache: dict[str, list[tuple[int, str, str]]] = {}
+
+
+def _all_course_enrollments(
+    context: BrowserContext, base_url: str, lp_version: str
+) -> list[tuple[int, str, str]]:
+    if base_url in _enrollment_cache:
+        return _enrollment_cache[base_url]
+    root = base_url.rstrip("/")
+    url: str | None = f"{root}/d2l/api/lp/{lp_version}/enrollments/myenrollments/?orgUnitTypeId=3&pageSize=100"
+    enrollments: list[tuple[int, str, str]] = []
+    pages = 0
+    while url:
+        resp = context.request.get(url)
+        if resp.status != 200:
+            raise RuntimeError(f"Enrollment list returned HTTP {resp.status}: {resp.text()[:300]}")
+        data = resp.json()
+        for item in data.get("Items", []):
+            org_unit = item.get("OrgUnit", {})
+            if org_unit.get("Id") is not None:
+                enrollments.append((org_unit["Id"], org_unit.get("Code") or "", org_unit.get("Name") or ""))
+        pages += 1
+        if pages % 50 == 0:
+            LOG.info("Scanning enrollments... %d so far.", len(enrollments))
+        paging = data.get("PagingInfo", {})
+        url = (
+            f"{root}/d2l/api/lp/{lp_version}/enrollments/myenrollments/"
+            f"?orgUnitTypeId=3&pageSize=100&bookmark={paging['Bookmark']}"
+            if paging.get("HasMoreItems")
+            else None
+        )
+    _enrollment_cache[base_url] = enrollments
+    return enrollments
+
+
+def find_org_unit_id_via_api(
+    context: BrowserContext, base_url: str, api_versions: dict[str, str], course_code: str
+) -> int | None:
+    """Look a course up in the user's own enrollment list when the
+    course-selector UI can't find it (it doesn't list older courses). Only
+    an exact match counts -- on the code, or on the name once trailing
+    whitespace is trimmed, allowing the given text to be a prefix that ends
+    at a "_" boundary -- and only if it identifies exactly one course.
+    Returns None (never raises) otherwise."""
+    lp_version = api_versions.get("lp")
+    if not lp_version:
+        return None
+    target = course_code.strip().lower()
+    try:
+        enrollments = _all_course_enrollments(context, base_url, lp_version)
+    except Exception:  # noqa: BLE001 - best-effort
+        LOG.debug("Couldn't list enrollments.", exc_info=True)
+        return None
+
+    def matches(text: str) -> bool:
+        text = text.strip().lower()
+        return text == target or text.startswith(target + "_")
+
+    hits = {
+        org_unit_id: (code, name.strip())
+        for org_unit_id, code, name in enrollments
+        if matches(code) or matches(name)
+    }
+    if len(hits) == 1:
+        return next(iter(hits))
+    LOG.info(
+        "Enrollment list had %d exact matches for %s%s.",
+        len(hits), course_code, f": {sorted(hits.items())}" if hits else "",
+    )
+    return None
+
+
 def _filename_from_response(resp, fallback_url: str) -> str:
     content_disposition = resp.headers.get("content-disposition", "")
     match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', content_disposition)
@@ -516,15 +591,19 @@ def wait_for_login(page: Page, home_url_fragment: str) -> None:
         )
 
 
-def open_course(page: Page, course_code: str) -> None:
+def open_course(page: Page, course_code: str, base_url: str, api_versions: dict[str, str]) -> None:
     """Best-effort automated course navigation, with a manual fallback."""
     LOG.info("Looking for course %s...", course_code)
     button = first_matching_locator(page, COURSE_SELECTOR_BUTTON_CANDIDATES)
-    if button:
+    if not button:
+        LOG.info("Course selector button not found on %s.", page.url)
+    else:
         try:
             button.click()
             search_box = first_matching_locator(page, COURSE_SEARCH_INPUT_CANDIDATES, timeout_ms=3000)
-            if search_box:
+            if not search_box:
+                LOG.info("Course search box not found after opening the course selector.")
+            else:
                 search_box.fill(course_code)
                 page.wait_for_timeout(800)  # let the results list filter
                 result = page.get_by_text(re.compile(re.escape(course_code), re.IGNORECASE)).first
@@ -535,11 +614,22 @@ def open_course(page: Page, course_code: str) -> None:
         except PlaywrightTimeoutError:
             LOG.info("Automated course search didn't pan out for %s.", course_code)
 
+    # The course selector doesn't list older courses, so look the course up
+    # in the enrollment list and open its Content page directly.
+    org_unit_id = find_org_unit_id_via_api(page.context, base_url, api_versions, course_code)
+    if org_unit_id is not None:
+        LOG.info("Found %s in the enrollment list (org unit %d); opening it directly.", course_code, org_unit_id)
+        page.goto(f"{base_url.rstrip('/')}/d2l/le/content/{org_unit_id}/Home")
+        return
+
     # Manual fallback
     print()
     print(f">>> Couldn't find '{course_code}' automatically.")
     print(f">>> In the open browser window, navigate to the {course_code} course's Content page.")
-    input(">>> Press Enter here once you're there (or Ctrl+C to abort): ")
+    try:
+        input(">>> Press Enter here once you're there (or Ctrl+C to abort): ")
+    except EOFError:
+        raise CourseNotFound(f"couldn't open {course_code} automatically and no terminal to ask for help")
 
 
 def ensure_on_content_page(page: Page) -> None:
@@ -761,7 +851,11 @@ def process_course(
     data: bytes
     filename: str
 
-    open_course(page, course_code)
+    # Start every course from the home page: after the previous course the
+    # browser is left on that course's Content page, where the course
+    # selector button isn't reliably found.
+    page.goto(base_url)
+    open_course(page, course_code, base_url, api_versions)
     ensure_on_content_page(page)
 
     org_unit_id = extract_org_unit_id(page)
