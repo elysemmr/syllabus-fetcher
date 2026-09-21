@@ -248,11 +248,15 @@ def find_syllabus_via_api(
         [(t.get("Title"), t.get("TypeIdentifier")) for t in topics],
     )
 
-    # Fast path: a topic whose own title says "syllabus" (an uploaded file).
+    # Fast path: a topic whose own title says "syllabus" -- an uploaded file,
+    # or a Link topic wrapping a file or a Google Doc.
     for topic in topics:
         if SYLLABUS_RE.search(topic.get("Title") or ""):
             LOG.debug("Topic title matches 'syllabus' directly: %r", topic.get("Title"))
-            result = _fetch_topic_file(context, base_url, le_version, org_unit_id, topic)
+            result = (
+                _fetch_topic_file(context, base_url, le_version, org_unit_id, topic)
+                or _download_from_topic_url(context, base_url, topic)
+            )
             if result:
                 return result
             LOG.debug("Fetching topic file for %r failed.", topic.get("Title"))
@@ -350,6 +354,62 @@ def _fetch_topic_file(
         return None
 
 
+GOOGLE_DOC_RE = re.compile(r"docs\.google\.com/document/d/([\w-]+)")
+# The path of an uploaded file as Brightspace's file viewer page embeds it in
+# its script (the iframe that shows the PDF is loaded from JS, not from HTML).
+VIEW_FILE_RE = re.compile(r"/d2l/lor/viewer/viewFile\.d2lfile/[^'\"\s)<>]+")
+
+
+def _download_from_topic_url(
+    context: BrowserContext, base_url: str, topic: dict
+) -> tuple[bytes, str] | None:
+    """For a topic that isn't an uploaded file (so its /file endpoint 404s),
+    follow its Url and pull the document out of what that points at: a
+    Google Doc (exported as PDF), or a Brightspace file viewer page (whose
+    script names the file's path)."""
+    title = topic.get("Title") or "syllabus"
+    url = topic.get("Url")
+    if not url:
+        LOG.debug("Topic %r has no Url to follow.", title)
+        return None
+    full_url = url if url.startswith("http") else f"{base_url.rstrip('/')}{url}"
+    try:
+        resp = context.request.get(full_url)
+        if resp.status != 200:
+            LOG.debug("Following topic %r (%s) returned HTTP %d.", title, full_url, resp.status)
+            return None
+        if "html" not in resp.headers.get("content-type", "").lower():
+            # The Url is the file itself.
+            return resp.body(), _filename_from_response(resp, unquote(resp.url))
+
+        doc = GOOGLE_DOC_RE.search(resp.url) or GOOGLE_DOC_RE.search(full_url)
+        if doc:
+            export = context.request.get(f"https://docs.google.com/document/d/{doc.group(1)}/export?format=pdf")
+            body = export.body() if export.status == 200 else b""
+            if body.startswith(b"%PDF"):
+                LOG.debug("Exported Google Doc %s as a PDF (%d bytes).", doc.group(1), len(body))
+                return body, _filename_from_response(export, f"{title.replace('/', '-')}.pdf")
+            LOG.debug(
+                "Google Doc export of %s returned HTTP %d (%d bytes, not a PDF).",
+                doc.group(1), export.status, len(body),
+            )
+            return None
+
+        match = VIEW_FILE_RE.search(resp.text())
+        if match:
+            file_url = f"{base_url.rstrip('/')}{match.group(0)}"
+            file_resp = context.request.get(file_url)
+            if file_resp.status == 200:
+                LOG.debug("Downloaded viewer file %s (%d bytes).", file_url, len(file_resp.body()))
+                return file_resp.body(), _filename_from_response(file_resp, unquote(file_url))
+            LOG.debug("Viewer file %s returned HTTP %d.", file_url, file_resp.status)
+        else:
+            LOG.debug("Topic %r's page names no Google Doc or viewer file.", title)
+    except Exception:  # noqa: BLE001 - best-effort
+        LOG.debug("Following topic %r (%s) raised an exception.", title, full_url, exc_info=True)
+    return None
+
+
 def try_api_auto_download(
     context: BrowserContext, base_url: str, api_versions: dict[str, str], org_unit_id: int
 ) -> tuple[bytes, str] | None:
@@ -405,8 +465,10 @@ def get_user_enrollments(context: BrowserContext, base_url: str, lp_version: str
     of {"Id", "Code", "Name"} dicts, via the admin-level enrollments API."""
     enrollments: list[dict] = []
     bookmark: str | None = None
-    for page_num in range(20):  # safety cap on pagination
-        params = {"bookmark": bookmark} if bookmark else {}
+    for page_num in range(500):  # safety cap on pagination
+        params = {"orgUnitTypeId": "3"}  # course offerings only, not departments/semesters/templates
+        if bookmark:
+            params["bookmark"] = bookmark
         try:
             resp = context.request.get(
                 f"{base_url.rstrip('/')}/d2l/api/lp/{lp_version}/enrollments/users/{user_id}/orgUnits/",
@@ -437,36 +499,52 @@ def get_user_enrollments(context: BrowserContext, base_url: str, lp_version: str
     return enrollments
 
 
-def match_enrollment(description: str, enrollments: list[dict]) -> dict | None:
+MAX_SECTIONS_TO_TRY = 6
+
+
+def match_enrollment(description: str, enrollments: list[dict]) -> list[dict]:
     """Fuzzy-match a loosely-formatted course description (as sent by
     whoever is requesting the syllabus) against a user's real enrollment
-    list, tolerating different separators/casing/extra words."""
+    list, tolerating different separators/casing/extra words. Returns the
+    courses to try, best first (empty if nothing matched or it was skipped)."""
     needle = normalize_code(description)
     if not needle:
-        return None
+        return []
     matches = [
         org_unit for org_unit in enrollments
         if needle in normalize_code(org_unit.get("Code")) or needle in normalize_code(org_unit.get("Name"))
     ]
-    if not matches:
-        return None
-    if len(matches) == 1:
-        return matches[0]
+    if len(matches) <= 1:
+        return matches
 
     print(f"\n'{description}' matched {len(matches)} courses in their enrollment log:")
     for i, org_unit in enumerate(matches):
         print(f"  [{i}] {org_unit.get('Name')} ({org_unit.get('Code')})")
-    choice = input("Which one did they mean? Enter a number (or press Enter to skip): ").strip()
+    try:
+        choice = input("Which one did they mean? Enter a number (or press Enter to skip): ").strip()
+    except EOFError:
+        # No one to ask (e.g. a background run): offer every match, newest
+        # dated offering first, since higher org unit IDs are created later.
+        # Master course templates ("PSYC_4063_ON_MC") have no year prefix and
+        # can carry higher IDs than real offerings, so they go last.
+        dated = [org_unit for org_unit in matches if re.match(r"\d{4}_", org_unit.get("Code") or "")]
+        undated = [org_unit for org_unit in matches if org_unit not in dated]
+        ordered = sorted(dated, key=lambda o: o["Id"], reverse=True) + sorted(undated, key=lambda o: o["Id"], reverse=True)
+        LOG.info(
+            "No terminal to ask; will try '%s' matches newest first: %s",
+            description, [org_unit.get("Code") for org_unit in ordered],
+        )
+        return ordered
     if not choice:
-        return None
+        return []
     try:
         index = int(choice)
         if not (0 <= index < len(matches)):
             raise ValueError
     except ValueError:
         LOG.error("Invalid selection, skipping '%s'.", description)
-        return None
-    return matches[index]
+        return []
+    return [matches[index]]
 
 
 def run_for_requester(
@@ -501,25 +579,39 @@ def run_for_requester(
 
     for description in descriptions:
         LOG.info("--- %s ---", description)
-        org_unit = match_enrollment(description, enrollments)
-        if org_unit is None:
-            LOG.error("No enrollment matched %r.", description)
-            results[description] = "FAILED: no matching course in their enrollment log"
-            continue
+        try:
+            candidates = match_enrollment(description, enrollments)
+            if not candidates:
+                LOG.error("No enrollment matched %r.", description)
+                results[description] = "FAILED: no matching course in their enrollment log"
+                continue
 
-        code = org_unit.get("Code") or description
-        LOG.info("Matched %r -> %s (%s)", description, org_unit.get("Name"), code)
-        api_result = try_api_auto_download(context, base_url, api_versions, org_unit["Id"])
-        if api_result is None:
-            LOG.error("Couldn't find/download a syllabus for %s via the API.", code)
-            results[description] = f"FAILED: syllabus not found for {code}"
-            continue
+            # A section may simply have no syllabus in its content, so keep
+            # going down the list (newest first) until one has it.
+            api_result = None
+            code = description
+            for org_unit in candidates[:MAX_SECTIONS_TO_TRY]:
+                code = org_unit.get("Code") or description
+                LOG.info("Trying %r -> %s (%s)", description, (org_unit.get("Name") or "").strip(), code)
+                api_result = try_api_auto_download(context, base_url, api_versions, org_unit["Id"])
+                if api_result is not None:
+                    break
+                LOG.info("No syllabus found in %s.", code)
+            if api_result is None:
+                LOG.error("Couldn't find/download a syllabus for %r in any matching course.", description)
+                results[description] = f"FAILED: syllabus not found for {description!r}"
+                continue
 
-        data, filename = api_result
-        saved_path = save_bytes(data, filename, output_dir, code)
-        saved_path = ensure_pdf(saved_path)
-        LOG.info("Saved %s -> %s", code, saved_path)
-        results[description] = f"OK: {saved_path}"
+            data, filename = api_result
+            saved_path = save_bytes(data, filename, output_dir, code)
+            saved_path = ensure_pdf(saved_path)
+            LOG.info("Saved %s -> %s", code, saved_path)
+            results[description] = f"OK: {saved_path}"
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - report and move to the next course
+            LOG.exception("Unexpected error on %s", description)
+            results[description] = f"ERROR: {exc}"
 
     return results
 
