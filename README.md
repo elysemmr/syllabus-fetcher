@@ -94,8 +94,12 @@ different separators/casing/extra words, e.g. "PSYC 4063" will match
 `2024_US_PSYC_4063_70_ON_ONLN`), then downloads each matched course's
 syllabus -- entirely via the API, no clicking. If an entry matches more than
 one of their courses, it'll list the options and ask you which one they
-meant. With no terminal to ask (e.g. a background run), it guesses the newest
-dated course and says so in the summary.
+meant. With no terminal to ask (e.g. a background run) it won't guess -- the
+enrollment data doesn't say which section they took -- so that entry fails and
+lists the candidates; put the year in the entry (`2024 PSYC 3063`) to pick one.
+`--guess-newest` opts in to taking the newest, flagged as a guess in the
+summary. A real student's log normally holds only their own section(s), so
+this mostly comes up with staff/admin accounts, who are enrolled everywhere.
 
 It only ever looks in the one course it picked, because students expect the
 syllabus from their own exact course: if that course has no syllabus, the

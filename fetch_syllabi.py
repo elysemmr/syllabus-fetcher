@@ -513,18 +513,38 @@ def get_user_enrollments(context: BrowserContext, base_url: str, lp_version: str
 MAX_SECTIONS_TO_TRY = 6
 
 
-def match_enrollment(description: str, enrollments: list[dict]) -> list[dict]:
+class AmbiguousCourse(Exception):
+    pass
+
+
+def match_enrollment(description: str, enrollments: list[dict], guess_newest: bool = False) -> list[dict]:
     """Fuzzy-match a loosely-formatted course description (as sent by
     whoever is requesting the syllabus) against a user's real enrollment
     list, tolerating different separators/casing/extra words. Returns the
-    courses to try, best first (empty if nothing matched or it was skipped)."""
+    courses to try, best first (empty if nothing matched or it was skipped).
+    Raises AmbiguousCourse if several courses match and there's no one to ask
+    (unless guess_newest is set)."""
     needle = normalize_code(description)
     if not needle:
         return []
-    matches = [
-        org_unit for org_unit in enrollments
-        if needle in normalize_code(org_unit.get("Code")) or needle in normalize_code(org_unit.get("Name"))
-    ]
+
+    def matches_all(*needles: str) -> list[dict]:
+        return [
+            org_unit for org_unit in enrollments
+            if all(
+                n in normalize_code(org_unit.get("Code")) or n in normalize_code(org_unit.get("Name"))
+                for n in needles
+            )
+        ]
+
+    matches = matches_all(needle)
+    if not matches:
+        # Words that aren't contiguous in the code still match, so a term can
+        # be given: "2024 PSYC 3063" finds "2024_US_PSYC_3063_60_ON_ONLN".
+        tokens = [normalize_code(t) for t in re.split(r"[^A-Za-z0-9]+", description)]
+        tokens = [t for t in tokens if t]
+        if len(tokens) > 1:
+            matches = matches_all(*tokens)
     if len(matches) <= 1:
         return matches
 
@@ -534,10 +554,18 @@ def match_enrollment(description: str, enrollments: list[dict]) -> list[dict]:
     try:
         choice = input("Which one did they mean? Enter a number (or press Enter to skip): ").strip()
     except EOFError:
-        # No one to ask (e.g. a background run): offer every match, newest
-        # dated offering first, since higher org unit IDs are created later.
-        # Master course templates ("PSYC_4063_ON_MC") have no year prefix and
-        # can carry higher IDs than real offerings, so they go last.
+        # No one to ask (e.g. a background run). Nothing in the enrollment
+        # data says which section the person took, so don't pick silently.
+        if not guess_newest:
+            codes = [org_unit.get("Code") for org_unit in matches]
+            raise AmbiguousCourse(
+                f"'{description}' matches {len(matches)} of their courses ({', '.join(codes)}); "
+                "add the year/term to the description (e.g. '2024 PSYC 3063'), or use --guess-newest"
+            )
+        # Offer every match, newest dated offering first, since higher org
+        # unit IDs are created later. Master course templates
+        # ("PSYC_4063_ON_MC") have no year prefix and can carry higher IDs
+        # than real offerings, so they go last.
         dated = [org_unit for org_unit in matches if re.match(r"\d{4}_", org_unit.get("Code") or "")]
         undated = [org_unit for org_unit in matches if org_unit not in dated]
         ordered = sorted(dated, key=lambda o: o["Id"], reverse=True) + sorted(undated, key=lambda o: o["Id"], reverse=True)
@@ -566,6 +594,7 @@ def run_for_requester(
     descriptions: list[str],
     output_dir: Path,
     allow_other_sections: bool = False,
+    guess_newest: bool = False,
 ) -> dict[str, str]:
     """Resolve a batch of loosely-formatted course descriptions against a
     specific person's real enrollment log (by username), then download each
@@ -592,7 +621,12 @@ def run_for_requester(
     for description in descriptions:
         LOG.info("--- %s ---", description)
         try:
-            candidates = match_enrollment(description, enrollments)
+            try:
+                candidates = match_enrollment(description, enrollments, guess_newest=guess_newest)
+            except AmbiguousCourse as exc:
+                LOG.error("%s", exc)
+                results[description] = f"FAILED: {exc}"
+                continue
             if not candidates:
                 LOG.error("No enrollment matched %r.", description)
                 results[description] = "FAILED: no matching course in their enrollment log"
@@ -1017,6 +1051,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "matching courses (newest first) and use theirs. Off by default, since that hands over "
         "a different term's syllabus than the one in the person's own course.",
     )
+    parser.add_argument(
+        "--guess-newest",
+        action="store_true",
+        help="With --requester: when a description matches several of the person's courses and "
+        "there's no terminal to ask, use the newest instead of failing. The enrollment data can't "
+        "say which section they took, so this is a guess (flagged in the summary).",
+    )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config.json")
     parser.add_argument("--output-dir", help="Where to save syllabi (default: ~/Desktop/Syllabi)")
     parser.add_argument(
@@ -1072,6 +1113,7 @@ def main(argv: list[str] | None = None) -> int:
             results = run_for_requester(
                 context, config["base_url"], api_versions, args.requester, course_codes, output_dir,
                 allow_other_sections=args.allow_other_sections,
+                guess_newest=args.guess_newest,
             )
         else:
             for course_code in course_codes:
