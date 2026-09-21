@@ -219,7 +219,13 @@ def find_syllabus_via_api(
             continue
         match = re.search(r'<a[^>]+href="([^"]+)"[^>]*>[^<]*syllabus[^<]*</a>', html, re.IGNORECASE)
         if not match:
-            LOG.debug("No syllabus link found in topic %r.", topic.get("Title"))
+            LOG.debug(
+                "No syllabus link found in topic %r (%d chars of HTML). "
+                "Any 'syllabus' mentions: %s. Start of content: %r",
+                topic.get("Title"), len(html),
+                [html[max(m.start() - 80, 0):m.end() + 80] for m in SYLLABUS_RE.finditer(html)][:5],
+                html[:300],
+            )
             continue
         href = match.group(1)
         try:
@@ -238,9 +244,14 @@ def find_syllabus_via_api(
 def _fetch_topic_file(
     context: BrowserContext, base_url: str, le_version: str, org_unit_id: int, topic: dict
 ) -> tuple[bytes, str] | None:
-    topic_id = topic.get("Id")
+    # The content TOC endpoint names a topic's numeric ID "TopicId" ("Id" is
+    # what the single-topic endpoints use), so accept either.
+    topic_id = topic.get("TopicId") or topic.get("Id")
     if topic_id is None:
-        LOG.debug("Topic %r has no Id, can't fetch its file.", topic.get("Title"))
+        LOG.debug(
+            "Topic %r has no TopicId/Id, can't fetch its file. Keys present: %s",
+            topic.get("Title"), sorted(topic),
+        )
         return None
     url = f"{base_url.rstrip('/')}/d2l/api/le/{le_version}/{org_unit_id}/content/topics/{topic_id}/file"
     try:
