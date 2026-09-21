@@ -94,7 +94,18 @@ different separators/casing/extra words, e.g. "PSYC 4063" will match
 `2024_US_PSYC_4063_70_ON_ONLN`), then downloads each matched course's
 syllabus -- entirely via the API, no clicking. If an entry matches more than
 one of their courses, it'll list the options and ask you which one they
-meant.
+meant. With no terminal to ask (e.g. a background run), it guesses the newest
+dated course and says so in the summary.
+
+It only ever looks in the one course it picked, because students expect the
+syllabus from their own exact course: if that course has no syllabus, the
+entry is reported as failed. Pass `--allow-other-sections` to instead fall
+back to the other matching courses (newest first); the summary then flags
+that the file came from a different course than the best match.
+
+The log names the topic and module the syllabus came from (e.g. "Syllabus is
+the topic 'CSEC 4003 Syllabus' (in 'Reference Information')"), so you can
+check it against what the student sees.
 
 **Requires an admin-level Brightspace account** (able to look up other
 users and their enrollments) -- this mode has no click-based fallback, so if

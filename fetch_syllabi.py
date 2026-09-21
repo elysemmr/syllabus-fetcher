@@ -221,10 +221,14 @@ def _filename_from_response(resp, fallback_url: str) -> str:
     return Path(fallback_url.split("?")[0]).name or "syllabus.pdf"
 
 
-def _iter_toc_topics(modules: list[dict]):
+def _iter_toc_topics(modules: list[dict], parents: tuple[str, ...] = ()):
+    """Yield every topic in the table of contents, each with a "ModulePath"
+    like "Reference Information > Week 1" saying where it sits."""
     for module in modules or []:
-        yield from module.get("Topics", []) or []
-        yield from _iter_toc_topics(module.get("Modules", []) or [])
+        path = parents + (module.get("Title") or "",)
+        for topic in module.get("Topics", []) or []:
+            yield {**topic, "ModulePath": " > ".join(part for part in path if part)}
+        yield from _iter_toc_topics(module.get("Modules", []) or [], path)
 
 
 def find_syllabus_via_api(
@@ -252,12 +256,16 @@ def find_syllabus_via_api(
     # or a Link topic wrapping a file or a Google Doc.
     for topic in topics:
         if SYLLABUS_RE.search(topic.get("Title") or ""):
-            LOG.debug("Topic title matches 'syllabus' directly: %r", topic.get("Title"))
+            LOG.debug(
+                "Topic title matches 'syllabus' directly: %r (in %r)",
+                topic.get("Title"), topic.get("ModulePath"),
+            )
             result = (
                 _fetch_topic_file(context, base_url, le_version, org_unit_id, topic)
                 or _download_from_topic_url(context, base_url, topic)
             )
             if result:
+                LOG.info("Syllabus is the topic %r (in %r).", topic.get("Title"), topic.get("ModulePath"))
                 return result
             LOG.debug("Fetching topic file for %r failed.", topic.get("Title"))
 
@@ -318,6 +326,9 @@ def find_syllabus_via_api(
             if file_resp.status == 200:
                 filename = _filename_from_response(file_resp, file_url)
                 LOG.debug("Downloaded syllabus %r (%d bytes) from %s", filename, len(file_resp.body()), file_url)
+                LOG.info(
+                    "Syllabus is a link inside the topic %r (in %r).", topic.get("Title"), topic.get("ModulePath")
+                )
                 return file_resp.body(), filename
             LOG.debug("Fetching syllabus file %r returned HTTP %d.", file_url, file_resp.status)
         except Exception:  # noqa: BLE001 - best-effort
@@ -554,6 +565,7 @@ def run_for_requester(
     username: str,
     descriptions: list[str],
     output_dir: Path,
+    allow_other_sections: bool = False,
 ) -> dict[str, str]:
     """Resolve a batch of loosely-formatted course descriptions against a
     specific person's real enrollment log (by username), then download each
@@ -586,27 +598,34 @@ def run_for_requester(
                 results[description] = "FAILED: no matching course in their enrollment log"
                 continue
 
-            # A section may simply have no syllabus in its content, so keep
-            # going down the list (newest first) until one has it.
+            # Students expect the syllabus of their own exact course, so by
+            # default only the best match is tried. Falling back to other
+            # sections (a different term's syllabus) needs --allow-other-sections.
+            notes: list[str] = []
+            if len(candidates) > 1:
+                notes.append(f"guessed the newest of {len(candidates)} matching courses")
             api_result = None
             code = description
-            for org_unit in candidates[:MAX_SECTIONS_TO_TRY]:
+            limit = MAX_SECTIONS_TO_TRY if allow_other_sections else 1
+            for position, org_unit in enumerate(candidates[:limit]):
                 code = org_unit.get("Code") or description
                 LOG.info("Trying %r -> %s (%s)", description, (org_unit.get("Name") or "").strip(), code)
                 api_result = try_api_auto_download(context, base_url, api_versions, org_unit["Id"])
                 if api_result is not None:
+                    if position > 0:
+                        notes.append(f"NOT the newest match: no syllabus in {candidates[0].get('Code')}")
                     break
                 LOG.info("No syllabus found in %s.", code)
             if api_result is None:
-                LOG.error("Couldn't find/download a syllabus for %r in any matching course.", description)
-                results[description] = f"FAILED: syllabus not found for {description!r}"
+                LOG.error("Couldn't find/download a syllabus for %r in %s.", description, code)
+                results[description] = f"FAILED: no syllabus found in {code}"
                 continue
 
             data, filename = api_result
             saved_path = save_bytes(data, filename, output_dir, code)
             saved_path = ensure_pdf(saved_path)
             LOG.info("Saved %s -> %s", code, saved_path)
-            results[description] = f"OK: {saved_path}"
+            results[description] = f"OK: {saved_path}" + (f" ({'; '.join(notes)})" if notes else "")
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001 - report and move to the next course
@@ -991,6 +1010,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "against that person's own enrollment log (requires admin-level API access), instead "
         "of course codes to search for in your own enrolled courses.",
     )
+    parser.add_argument(
+        "--allow-other-sections",
+        action="store_true",
+        help="With --requester: if the best-matching course has no syllabus, try the other "
+        "matching courses (newest first) and use theirs. Off by default, since that hands over "
+        "a different term's syllabus than the one in the person's own course.",
+    )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config.json")
     parser.add_argument("--output-dir", help="Where to save syllabi (default: ~/Desktop/Syllabi)")
     parser.add_argument(
@@ -1044,7 +1070,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.requester:
             results = run_for_requester(
-                context, config["base_url"], api_versions, args.requester, course_codes, output_dir
+                context, config["base_url"], api_versions, args.requester, course_codes, output_dir,
+                allow_other_sections=args.allow_other_sections,
             )
         else:
             for course_code in course_codes:
