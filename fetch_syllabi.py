@@ -156,7 +156,10 @@ def _all_course_enrollments(
     enrollments: list[tuple[int, str, str]] = []
     pages = 0
     while url:
-        resp = context.request.get(url)
+        # A 30s cap per page: without it, one stalled request hangs the
+        # whole run with no way to skip it, since this isn't interruptible
+        # by the usual per-course "press Enter" prompts.
+        resp = context.request.get(url, timeout=30_000)
         if resp.status != 200:
             raise RuntimeError(f"Enrollment list returned HTTP {resp.status}: {resp.text()[:300]}")
         data = resp.json()
@@ -165,7 +168,7 @@ def _all_course_enrollments(
             if org_unit.get("Id") is not None:
                 enrollments.append((org_unit["Id"], org_unit.get("Code") or "", org_unit.get("Name") or ""))
         pages += 1
-        if pages % 50 == 0:
+        if pages % 10 == 0:
             LOG.info("Scanning enrollments... %d so far.", len(enrollments))
         paging = data.get("PagingInfo", {})
         url = (
@@ -615,13 +618,14 @@ def master_course_codes(description: str) -> list[str]:
 def find_master_course(
     context: BrowserContext, base_url: str, api_versions: dict[str, str], description: str
 ) -> list[dict]:
-    """The master course for the bare course code in a description, for when
-    the person's own enrollment log has no match: the ON master if there is
-    one, otherwise the TR master. A student's log won't hold master courses,
-    so this searches the logged-in account's enrollments (an admin is
-    enrolled in them). Only an exact code match counts, so "..._ON_MC_DNU"
-    copies don't. Each result is flagged with "_master" so the summary can
-    say so."""
+    """Every master course for the bare course code in a description, for
+    when the person's own enrollment log has no match: the ON master, then
+    the TR master, in that order -- both are included (not just the first
+    one found), so a caller can still try the other if the first has no
+    syllabus. A student's log won't hold master courses, so this searches
+    the logged-in account's enrollments (an admin is enrolled in them).
+    Only an exact code match counts, so "..._ON_MC_DNU" copies don't. Each
+    result is flagged with "_master" so the summary can say so."""
     codes = master_course_codes(description)
     lp_version = api_versions.get("lp")
     if not codes or not lp_version:
@@ -631,18 +635,24 @@ def find_master_course(
     except Exception:  # noqa: BLE001 - best-effort
         LOG.debug("Couldn't list the logged-in account's enrollments.", exc_info=True)
         return []
+    masters: list[dict] = []
     for code in codes:
         wanted = normalize_code(code)
-        found = [
-            {"Id": org_unit_id, "Code": found_code, "Name": name, "_master": True}
-            for org_unit_id, found_code, name in enrollments
-            if normalize_code(found_code) == wanted
-        ]
+        found = sorted(
+            (
+                {"Id": org_unit_id, "Code": found_code, "Name": name, "_master": True}
+                for org_unit_id, found_code, name in enrollments
+                if normalize_code(found_code) == wanted
+            ),
+            key=lambda org_unit: org_unit["Id"],
+            reverse=True,
+        )
         if found:
             LOG.info("Found the master course %s.", code)
-            return sorted(found, key=lambda org_unit: org_unit["Id"], reverse=True)
-        LOG.info("No master course %s.", code)
-    return []
+        else:
+            LOG.info("No master course %s.", code)
+        masters.extend(found)
+    return masters
 
 
 def is_bare_course_code(text: str) -> bool:
@@ -657,25 +667,28 @@ def is_bare_course_code(text: str) -> bool:
     return not any(ch.isdigit() for ch in remainder)
 
 
-def find_default_course(
+def find_default_course_candidates(
     context: BrowserContext, base_url: str, api_versions: dict[str, str], description: str
-) -> tuple[int, str, str] | None:
-    """For a bare course code with no requester: its master course (ON, else
-    TR), and failing that its most recent section. Searches the logged-in
-    account's enrollments. Returns (org unit ID, course code, which kind)."""
-    masters = find_master_course(context, base_url, api_versions, description)
-    if masters:
-        return masters[0]["Id"], masters[0]["Code"], "master course"
+) -> list[dict]:
+    """Every candidate course to try for a bare course code with no
+    requester, best first: the ON master, the TR master, then its most
+    recent section -- so if the best one turns out to have no syllabus, the
+    caller can move on to the next instead of giving up. Searches the
+    logged-in account's enrollments. Same {"Id", "Code", "Name", ...} shape
+    as find_master_course/match_enrollment; a section candidate has no
+    "_master" key."""
+    candidates = find_master_course(context, base_url, api_versions, description)
+    seen_ids = {c["Id"] for c in candidates}
 
     bare = BARE_COURSE_CODE_RE.search(description)
     lp_version = api_versions.get("lp")
     if not bare or not lp_version:
-        return None
+        return candidates
     try:
         enrollments = _all_course_enrollments(context, base_url, lp_version)
     except Exception:  # noqa: BLE001 - best-effort
         LOG.debug("Couldn't list the logged-in account's enrollments.", exc_info=True)
-        return None
+        return candidates
     # The department can't sit inside a longer word, nor the number run on
     # into more digits ("ABCD 1234" is not "ABCD_12345").
     this_course = re.compile(rf"(?<![A-Za-z]){bare.group(1)}[\s_-]*{bare.group(2)}(?!\d)", re.IGNORECASE)
@@ -690,9 +703,45 @@ def find_default_course(
     pool = dated or sections
     if not pool:
         LOG.info("No section of %s %s either.", bare.group(1).upper(), bare.group(2))
-        return None
+        return candidates
     org_unit_id, code = max(pool)
-    return org_unit_id, code, "most recent course"
+    if org_unit_id not in seen_ids:
+        candidates.append({"Id": org_unit_id, "Code": code, "Name": ""})
+    return candidates
+
+
+def process_bare_course(
+    context: BrowserContext,
+    base_url: str,
+    api_versions: dict[str, str],
+    description: str,
+    output_dir: Path,
+) -> Path:
+    """Resolve a bare course code ("PSYC 4063") entirely via the API: try
+    its master course(s), then its most recent section, until one actually
+    has a syllabus. No browser clicking and no manual fallback -- picking
+    among several possible courses isn't something a person clicking through
+    the UI can help with, so if none of the candidates have a syllabus, this
+    raises SyllabusNotFound and the caller reports it and moves on."""
+    candidates = find_default_course_candidates(context, base_url, api_versions, description)
+    if not candidates:
+        raise CourseNotFound(f"no master course or section found for {description!r}")
+
+    for candidate in candidates[:MAX_SECTIONS_TO_TRY]:
+        code = candidate.get("Code") or description
+        kind = "master course" if candidate.get("_master") else "most recent course"
+        LOG.info("Trying the %s %s for %r (org unit %s).", kind, code, description, candidate["Id"])
+        api_result = try_api_auto_download(context, base_url, api_versions, candidate["Id"])
+        if api_result is not None:
+            data, filename = api_result
+            saved_path = save_bytes(data, filename, output_dir, description)
+            LOG.info("Saved %s -> %s", code, saved_path)
+            return ensure_pdf(saved_path)
+        why = _search_failure_reason.get(candidate["Id"])
+        LOG.info("No syllabus in %s%s.", code, f": {why}" if why else "")
+
+    tried = ", ".join(candidate.get("Code") or "?" for candidate in candidates[:MAX_SECTIONS_TO_TRY])
+    raise SyllabusNotFound(f"no syllabus found for {description!r} (tried: {tried})")
 
 
 def match_enrollment(
@@ -932,19 +981,14 @@ def wait_for_login(page: Page, home_url_fragment: str) -> None:
 
 
 def open_course(page: Page, course_code: str, base_url: str, api_versions: dict[str, str]) -> None:
-    """Best-effort automated course navigation, with a manual fallback."""
-    LOG.info("Looking for course %s...", course_code)
+    """Best-effort automated course navigation, with a manual fallback.
 
-    # A bare code ("PSYC 4063") means its master course, else its most recent
-    # section, found through the enrollment list rather than the selector.
-    if is_bare_course_code(course_code):
-        default = find_default_course(page.context, base_url, api_versions, course_code)
-        if default:
-            org_unit_id, code, kind = default
-            LOG.info("Using the %s %s for %s (org unit %d).", kind, code, course_code, org_unit_id)
-            page.goto(f"{base_url.rstrip('/')}/d2l/le/content/{org_unit_id}/Home")
-            return
-        LOG.info("No master course or section found for %s; trying the course selector.", course_code)
+    Only called for a specific, non-bare course code -- a bare code
+    ("PSYC 4063") is resolved to a master course or section and downloaded
+    entirely via the API by process_bare_course() before this is ever
+    reached, since picking among several possible courses isn't something
+    clicking through the UI can help with."""
+    LOG.info("Looking for course %s...", course_code)
     button = first_matching_locator(page, COURSE_SELECTOR_BUTTON_CANDIDATES)
     if not button:
         LOG.info("Course selector button not found on %s.", page.url)
@@ -1324,7 +1368,14 @@ def main(argv: list[str] | None = None) -> int:
             for course_code in course_codes:
                 LOG.info("--- %s ---", course_code)
                 try:
-                    saved_path = process_course(page, course_code, output_dir, config["base_url"], api_versions)
+                    if is_bare_course_code(course_code):
+                        saved_path = process_bare_course(
+                            context, config["base_url"], api_versions, course_code, output_dir
+                        )
+                    else:
+                        saved_path = process_course(
+                            page, course_code, output_dir, config["base_url"], api_versions
+                        )
                     LOG.info("Saved %s -> %s", course_code, saved_path)
                     results[course_code] = f"OK: {saved_path}"
                 except (CourseNotFound, SyllabusNotFound) as exc:

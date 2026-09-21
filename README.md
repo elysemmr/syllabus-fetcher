@@ -64,14 +64,21 @@ code and converted to PDF if it wasn't one already (e.g. `Syllabi/CSE201.pdf`,
 
 ### Bare course codes (no `--requester`)
 
-An entry that is just a department and number (`psyc 4063`, `BIOL-1334`) names
-no term or section. The script uses that course's master course, looked up in
-your account's enrollments: `PSYC_4063_ON_MC`,
-else `PSYC_4063_TR_MC`, else the most recent section of the course (the
-highest-numbered dated offering, ignoring "do not use" copies). It then opens
-that course directly, without the course selector. The file is named by what you
-typed (`psyc_4063.pdf`). Entries that name a specific course (a year, section,
-or full course code) are searched for as before.
+An entry that is just a department and number, optionally with a trailing
+course title (`psyc 4063`, `BIOL-1334`, `BBUS 2123 Macroeconomics`) names no
+term or section. The script tries, in order -- entirely via the API, no
+browser clicking -- its master course `PSYC_4063_ON_MC`, else
+`PSYC_4063_TR_MC`, else its most recent section (the highest-numbered dated
+offering, ignoring "do not use" copies): each candidate is checked for an
+actual syllabus, not just picked by name, so if one has no content the
+script moves on to the next rather than getting stuck. If none of them have
+a syllabus, that entry is reported as failed in the summary and the script
+moves on to the next course -- there's no manual-fallback prompt for this
+path, since picking among several possible courses isn't something clicking
+through the UI can help with. The file is named by what you typed
+(`psyc_4063.pdf`). Entries that name a specific course (a year, section, or
+full course code) are searched for as before, with the usual manual
+fallback if automation can't find it.
 
 ### Manual fallback
 
