@@ -279,13 +279,13 @@ def find_syllabus_via_api(
         )
         if resp.status != 200:
             LOG.debug("Content TOC lookup returned HTTP %d: %s", resp.status, resp.text()[:500])
-            _search_failure_reason[org_unit_id] = f"its content table of contents returned HTTP {resp.status}"
+            _search_failure_reason[org_unit_id] = f"content list returned HTTP {resp.status}"
             return None
         modules = resp.json().get("Modules", []) or []
         topics = list(_iter_toc_topics(modules))
     except Exception:  # noqa: BLE001 - best-effort
         LOG.debug("Content TOC lookup failed.", exc_info=True)
-        _search_failure_reason[org_unit_id] = "its content table of contents couldn't be read"
+        _search_failure_reason[org_unit_id] = "content list unreadable"
         return None
     # The search reads File, Link and HTML topics only; say so when others exist.
     unsearched = [
@@ -297,17 +297,12 @@ def find_syllabus_via_api(
         )
     ]
     if not topics:
-        _search_failure_reason[org_unit_id] = (
-            "its content table of contents lists no topics, and no module description links to a syllabus"
-        )
+        _search_failure_reason[org_unit_id] = "course has no content"
     else:
-        reason = (
-            f"no module description links to a syllabus, and none of its {len(topics) - len(unsearched)} "
-            "searchable content topics is, or links to, one"
-        )
+        reason = f"not in {len(topics) - len(unsearched)} searchable topics or module descriptions"
         if unsearched:
             types = sorted({topic.get("TypeIdentifier") or "unknown" for topic in unsearched})
-            reason += f"; its {len(unsearched)} topics of type {', '.join(types)} aren't searched"
+            reason += f"; {len(unsearched)} unsearched ({', '.join(types)})"
         _search_failure_reason[org_unit_id] = reason
     undownloadable: list[str] = []
 
@@ -403,8 +398,7 @@ def find_syllabus_via_api(
 
     if undownloadable:
         _search_failure_reason[org_unit_id] = (
-            f"it has a syllabus topic ({', '.join(repr(title) for title in undownloadable)}) "
-            "but the file couldn't be downloaded"
+            f"syllabus topic {', '.join(repr(title) for title in undownloadable)} won't download"
         )
     return None
 
@@ -689,11 +683,7 @@ def match_enrollment(
         # No one to ask (e.g. a background run). Nothing in the enrollment
         # data says which section the person took, so don't pick silently.
         if not guess_newest:
-            codes = [org_unit.get("Code") for org_unit in matches]
-            raise AmbiguousCourse(
-                f"'{description}' matches {len(matches)} of their courses ({', '.join(codes)}); "
-                "add the year/term to the description (e.g. '2024 PSYC 3063'), or use --guess-newest"
-            )
+            raise AmbiguousCourse(f"matches {len(matches)} courses; add the year (e.g. '2024 {description}')")
         # Offer every match, newest dated offering first, since higher org
         # unit IDs are created later. Master course templates
         # ("PSYC_4063_ON_MC") have no year prefix and can carry higher IDs
@@ -701,10 +691,7 @@ def match_enrollment(
         dated = [org_unit for org_unit in matches if re.match(r"\d{4}_", org_unit.get("Code") or "")]
         undated = [org_unit for org_unit in matches if org_unit not in dated]
         ordered = sorted(dated, key=lambda o: o["Id"], reverse=True) + sorted(undated, key=lambda o: o["Id"], reverse=True)
-        LOG.info(
-            "No terminal to ask; will try '%s' matches newest first: %s",
-            description, [org_unit.get("Code") for org_unit in ordered],
-        )
+        LOG.info("No terminal to ask; trying '%s' matches newest first.", description)
         return ordered
     if not choice:
         raise CourseSkipped(f"skipped '{description}' (no course chosen)")
@@ -764,13 +751,11 @@ def run_for_requester(
             if not candidates:
                 masters = master_course_codes(description)
                 why = (
-                    f"no course matching '{description}' in their enrollment log, and no master course "
-                    f"{' or '.join(masters)}"
+                    f"not in their log; no ON/TR master for {masters[0].rsplit('_', 2)[0]}"
                     if masters
-                    else f"no course matching '{description}' in their enrollment log, and no course code "
-                    "like 'PSYC 4063' in it to look up a master course by"
+                    else "not in their log; no course code to find a master course by"
                 )
-                LOG.error("No syllabus for %r: %s.", description, why)
+                LOG.error("No syllabus for %r: %s", description, why)
                 results[description] = f"FAILED: {why}"
                 continue
 
@@ -779,9 +764,9 @@ def run_for_requester(
             # sections (a different term's syllabus) needs --allow-other-sections.
             notes: list[str] = []
             if candidates[0].get("_master"):
-                notes.append("not in their enrollment log; used the master course")
+                notes.append("master course")
             elif len(candidates) > 1:
-                notes.append(f"guessed the newest of {len(candidates)} matching courses")
+                notes.append(f"guessed newest of {len(candidates)}")
             api_result = None
             code = description
             limit = MAX_SECTIONS_TO_TRY if allow_other_sections else 1
@@ -791,20 +776,20 @@ def run_for_requester(
                 api_result = try_api_auto_download(context, base_url, api_versions, org_unit["Id"])
                 if api_result is not None:
                     if position > 0:
-                        notes.append(f"NOT the newest match: no syllabus in {candidates[0].get('Code')}")
+                        notes.append(f"not newest; {candidates[0].get('Code')} had none")
                     break
                 LOG.info("No syllabus found in %s.", code)
             if api_result is None:
                 why = _search_failure_reason.get(org_unit["Id"])
-                LOG.error("Couldn't find/download a syllabus for %r in %s%s.", description, code, f": {why}" if why else "")
-                results[description] = f"FAILED: no syllabus found in {code}" + (f" ({why})" if why else "")
+                LOG.error("No syllabus for %r in %s%s", description, code, f": {why}" if why else "")
+                results[description] = f"FAILED: no syllabus in {code}" + (f": {why}" if why else "")
                 continue
 
             data, filename = api_result
             saved_path = save_bytes(data, filename, output_dir, code)
             saved_path = ensure_pdf(saved_path)
             LOG.info("Saved %s -> %s", code, saved_path)
-            results[description] = f"OK: {saved_path}" + (f" ({'; '.join(notes)})" if notes else "")
+            results[description] = f"OK: {saved_path}" + (f" [{'; '.join(notes)}]" if notes else "")
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001 - report and move to the next course
