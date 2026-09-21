@@ -122,56 +122,16 @@ def get_api_versions(context: BrowserContext, base_url: str) -> dict[str, str]:
     return versions
 
 
-def find_org_unit_id(context: BrowserContext, base_url: str, lp_version: str, course_code: str) -> int | None:
-    """Look up the numeric org unit ID Brightspace uses internally for a
-    course, by matching course_code against the logged-in user's own
-    enrollments (so this never depends on the course-selector UI)."""
-    bookmark: str | None = None
-    needle = course_code.lower()
-    seen_codes: list[str] = []
-    for page_num in range(20):  # safety cap on pagination
-        params = {"orgUnitTypeId": "3"}
-        if bookmark:
-            params["bookmark"] = bookmark
-        try:
-            resp = context.request.get(
-                f"{base_url.rstrip('/')}/d2l/api/lp/{lp_version}/enrollments/myenrollments/",
-                params=params,
-            )
-            if resp.status != 200:
-                LOG.debug(
-                    "Enrollment lookup (page %d) returned HTTP %d: %s",
-                    page_num, resp.status, resp.text()[:500],
-                )
-                return None
-            data = resp.json()
-        except Exception:  # noqa: BLE001 - best-effort
-            LOG.debug("Enrollment lookup failed.", exc_info=True)
-            return None
+ORG_UNIT_URL_RE = re.compile(r"/d2l/le/content/(\d+)")
 
-        items = data.get("Items", [])
-        LOG.debug("Enrollment lookup page %d: %d items.", page_num, len(items))
-        for item in items:
-            org_unit = item.get("OrgUnit") or {}
-            code = (org_unit.get("Code") or "").lower()
-            name = (org_unit.get("Name") or "").lower()
-            if not code and not name:
-                continue
-            seen_codes.append(f"Code={org_unit.get('Code')!r} Name={org_unit.get('Name')!r}")
-            if needle in code or needle in name or code in needle or (name and name in needle):
-                LOG.debug("Matched course code to org unit %s (%s).", org_unit.get("Id"), seen_codes[-1])
-                return org_unit.get("Id")
 
-        paging = data.get("PagingInfo") or {}
-        if not paging.get("HasMoreItems"):
-            break
-        bookmark = paging.get("Bookmark")
-
-    LOG.debug(
-        "No enrollment matched course code %r. Enrollments seen (%d): %s",
-        course_code, len(seen_codes), seen_codes,
-    )
-    return None
+def extract_org_unit_id(page: Page) -> int | None:
+    """Read the numeric org unit ID straight out of the current page's URL,
+    once the course-selector UI has already navigated to the course's
+    Content page. Far more reliable than independently re-deriving it by
+    matching the course code against a potentially huge enrollment history."""
+    match = ORG_UNIT_URL_RE.search(page.url)
+    return int(match.group(1)) if match else None
 
 
 def _filename_from_response(resp, fallback_url: str) -> str:
@@ -273,19 +233,16 @@ def _fetch_topic_file(
 
 
 def try_api_auto_download(
-    context: BrowserContext, base_url: str, api_versions: dict[str, str], course_code: str
+    context: BrowserContext, base_url: str, api_versions: dict[str, str], org_unit_id: int
 ) -> tuple[bytes, str] | None:
-    """Best-effort end-to-end attempt via Brightspace's REST API, with no
-    browser clicking at all. Returns None (never raises) on any failure so
-    the caller can fall back to the click-based flow."""
-    lp_version = api_versions.get("lp")
+    """Best-effort content search via Brightspace's REST API for a course
+    whose org unit ID is already known (read from the URL after the
+    course-selector UI has navigated there). Returns None (never raises) on
+    any failure so the caller can fall back to the click-based flow."""
     le_version = api_versions.get("le")
-    if not lp_version or not le_version:
+    if not le_version:
         return None
     try:
-        org_unit_id = find_org_unit_id(context, base_url, lp_version, course_code)
-        if org_unit_id is None:
-            return None
         return find_syllabus_via_api(context, base_url, le_version, org_unit_id)
     except Exception:  # noqa: BLE001 - this whole path is best-effort
         LOG.debug("API auto-download attempt failed.", exc_info=True)
@@ -607,13 +564,19 @@ def process_course(
     data: bytes
     filename: str
 
-    api_result = try_api_auto_download(page.context, base_url, api_versions, course_code)
+    open_course(page, course_code)
+    ensure_on_content_page(page)
+
+    org_unit_id = extract_org_unit_id(page)
+    api_result = (
+        try_api_auto_download(page.context, base_url, api_versions, org_unit_id)
+        if org_unit_id is not None
+        else None
+    )
     if api_result is not None:
         LOG.info("Found and downloaded the syllabus via Brightspace's API -- no clicking needed.")
         data, filename = api_result
     else:
-        open_course(page, course_code)
-        ensure_on_content_page(page)
         expand_all_modules(page)
 
         found = find_syllabus_locator(page.context)
