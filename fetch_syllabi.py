@@ -692,10 +692,13 @@ def find_default_course_candidates(
     # The department can't sit inside a longer word, nor the number run on
     # into more digits ("ABCD 1234" is not "ABCD_12345").
     this_course = re.compile(rf"(?<![A-Za-z]){bare.group(1)}[\s_-]*{bare.group(2)}(?!\d)", re.IGNORECASE)
+    # "_FX_" marks an extension/satellite-site section, not the offering a
+    # bare code should default to.
+    excluded = re.compile(r"DNU|_OLD|DO NOT USE|(?:^|_)FX(?:_|$)", re.IGNORECASE)
     sections = [
         (org_unit_id, code)
         for org_unit_id, code, name in enrollments
-        if this_course.search(code) and not re.search(r"DNU|_OLD|DO NOT USE", f"{code} {name}", re.IGNORECASE)
+        if this_course.search(code) and not excluded.search(f"{code} {name}")
     ]
     # Real offerings carry a year ("2025_US_..."); templates don't. Higher IDs
     # are created later.
