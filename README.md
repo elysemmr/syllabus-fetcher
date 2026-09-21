@@ -109,6 +109,11 @@ enrollments since a student's log won't hold master courses. The summary flags
 such results as coming from the master course, and the first lookup scans your
 whole enrollment list (about a minute), once per run.
 
+A syllabus that is a link to a Google Doc is exported as it is *now*: the
+document may have been edited since the student's term (or be shared by several
+terms' courses), so those results are flagged `[live Google Doc, may differ
+from that term]`.
+
 When no syllabus is found, the summary says why: no matching course or master
 course (naming the codes it looked for), or the course it did pick had no
 syllabus link in its module descriptions or among its N searchable content

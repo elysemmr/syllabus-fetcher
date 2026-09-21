@@ -268,6 +268,9 @@ def _iter_toc_topics(modules: list[dict], parents: tuple[str, ...] = ()):
 # Why the last syllabus search in each course (by org unit ID) came up empty,
 # for the summary. Filled in by find_syllabus_via_api.
 _search_failure_reason: dict[int, str] = {}
+# A caveat about where a found syllabus came from (e.g. a live Google Doc),
+# by org unit ID, for the summary.
+_source_note: dict[int, str] = {}
 
 
 def find_syllabus_via_api(
@@ -304,6 +307,7 @@ def find_syllabus_via_api(
             types = sorted({topic.get("TypeIdentifier") or "unknown" for topic in unsearched})
             reason += f"; {len(unsearched)} unsearched ({', '.join(types)})"
         _search_failure_reason[org_unit_id] = reason
+    _source_note.pop(org_unit_id, None)
     undownloadable: list[str] = []
 
     LOG.debug(
@@ -320,12 +324,16 @@ def find_syllabus_via_api(
                 "Topic title matches 'syllabus' directly: %r (in %r)",
                 topic.get("Title"), topic.get("ModulePath"),
             )
+            source_notes: list[str] = []
             result = (
                 _fetch_topic_file(context, base_url, le_version, org_unit_id, topic)
-                or _download_from_topic_url(context, base_url, topic)
+                or _download_from_topic_url(context, base_url, topic, source_notes)
             )
             if result:
+                _source_note[org_unit_id] = "; ".join(source_notes)
                 LOG.info("Syllabus is the topic %r (in %r).", topic.get("Title"), topic.get("ModulePath"))
+                if source_notes:
+                    LOG.info("Note: %s.", "; ".join(source_notes))
                 return result
             LOG.debug("Fetching topic file for %r failed.", topic.get("Title"))
             undownloadable.append(topic.get("Title") or "")
@@ -437,7 +445,7 @@ VIEW_FILE_RE = re.compile(r"/d2l/lor/viewer/viewFile\.d2lfile/[^'\"\s)<>]+")
 
 
 def _download_from_topic_url(
-    context: BrowserContext, base_url: str, topic: dict
+    context: BrowserContext, base_url: str, topic: dict, notes: list[str] | None = None
 ) -> tuple[bytes, str] | None:
     """For a topic that isn't an uploaded file (so its /file endpoint 404s),
     follow its Url and pull the document out of what that points at: a
@@ -464,6 +472,8 @@ def _download_from_topic_url(
             body = export.body() if export.status == 200 else b""
             if body.startswith(b"%PDF"):
                 LOG.debug("Exported Google Doc %s as a PDF (%d bytes).", doc.group(1), len(body))
+                if notes is not None:
+                    notes.append("live Google Doc, may differ from that term")
                 return body, _filename_from_response(export, f"{title.replace('/', '-')}.pdf")
             LOG.debug(
                 "Google Doc export of %s returned HTTP %d (%d bytes, not a PDF).",
@@ -786,6 +796,8 @@ def run_for_requester(
                 continue
 
             data, filename = api_result
+            if _source_note.get(org_unit["Id"]):
+                notes.append(_source_note[org_unit["Id"]])
             saved_path = save_bytes(data, filename, output_dir, code)
             saved_path = ensure_pdf(saved_path)
             LOG.info("Saved %s -> %s", code, saved_path)
