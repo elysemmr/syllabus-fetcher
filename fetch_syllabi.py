@@ -228,11 +228,14 @@ def find_syllabus_via_api(
             )
             continue
         href = match.group(1)
+        LOG.debug("Syllabus link found in topic %r: %s", topic.get("Title"), href)
         try:
             file_url = href if href.startswith("http") else f"{base_url.rstrip('/')}{href}"
             file_resp = context.request.get(file_url)
             if file_resp.status == 200:
-                return file_resp.body(), _filename_from_response(file_resp, file_url)
+                filename = _filename_from_response(file_resp, file_url)
+                LOG.debug("Downloaded syllabus %r (%d bytes) from %s", filename, len(file_resp.body()), file_url)
+                return file_resp.body(), filename
             LOG.debug("Fetching syllabus file %r returned HTTP %d.", file_url, file_resp.status)
         except Exception:  # noqa: BLE001 - best-effort
             LOG.debug("Fetching syllabus file %r failed.", href, exc_info=True)
