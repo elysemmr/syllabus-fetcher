@@ -639,10 +639,54 @@ def find_master_course(
             if normalize_code(found_code) == wanted
         ]
         if found:
-            LOG.info("No match in their enrollment log; found the master course %s.", code)
+            LOG.info("Found the master course %s.", code)
             return sorted(found, key=lambda org_unit: org_unit["Id"], reverse=True)
-        LOG.info("No master course %s either.", code)
+        LOG.info("No master course %s.", code)
     return []
+
+
+def is_bare_course_code(text: str) -> bool:
+    """True for just a department and number ("PSYC 4063", "psyc_4063"),
+    with no year, section or other detail naming a specific course."""
+    return re.fullmatch(r"\s*[A-Za-z]{2,5}[\s_-]*\d{3,4}\s*", text) is not None
+
+
+def find_default_course(
+    context: BrowserContext, base_url: str, api_versions: dict[str, str], description: str
+) -> tuple[int, str, str] | None:
+    """For a bare course code with no requester: its master course (ON, else
+    TR), and failing that its most recent section. Searches the logged-in
+    account's enrollments. Returns (org unit ID, course code, which kind)."""
+    masters = find_master_course(context, base_url, api_versions, description)
+    if masters:
+        return masters[0]["Id"], masters[0]["Code"], "master course"
+
+    bare = BARE_COURSE_CODE_RE.search(description)
+    lp_version = api_versions.get("lp")
+    if not bare or not lp_version:
+        return None
+    try:
+        enrollments = _all_course_enrollments(context, base_url, lp_version)
+    except Exception:  # noqa: BLE001 - best-effort
+        LOG.debug("Couldn't list the logged-in account's enrollments.", exc_info=True)
+        return None
+    # The department can't sit inside a longer word, nor the number run on
+    # into more digits ("ABCD 1234" is not "ABCD_12345").
+    this_course = re.compile(rf"(?<![A-Za-z]){bare.group(1)}[\s_-]*{bare.group(2)}(?!\d)", re.IGNORECASE)
+    sections = [
+        (org_unit_id, code)
+        for org_unit_id, code, name in enrollments
+        if this_course.search(code) and not re.search(r"DNU|_OLD|DO NOT USE", f"{code} {name}", re.IGNORECASE)
+    ]
+    # Real offerings carry a year ("2025_US_..."); templates don't. Higher IDs
+    # are created later.
+    dated = [section for section in sections if re.match(r"\d{4}_", section[1])]
+    pool = dated or sections
+    if not pool:
+        LOG.info("No section of %s %s either.", bare.group(1).upper(), bare.group(2))
+        return None
+    org_unit_id, code = max(pool)
+    return org_unit_id, code, "most recent course"
 
 
 def match_enrollment(
@@ -884,6 +928,17 @@ def wait_for_login(page: Page, home_url_fragment: str) -> None:
 def open_course(page: Page, course_code: str, base_url: str, api_versions: dict[str, str]) -> None:
     """Best-effort automated course navigation, with a manual fallback."""
     LOG.info("Looking for course %s...", course_code)
+
+    # A bare code ("PSYC 4063") means its master course, else its most recent
+    # section, found through the enrollment list rather than the selector.
+    if is_bare_course_code(course_code):
+        default = find_default_course(page.context, base_url, api_versions, course_code)
+        if default:
+            org_unit_id, code, kind = default
+            LOG.info("Using the %s %s for %s (org unit %d).", kind, code, course_code, org_unit_id)
+            page.goto(f"{base_url.rstrip('/')}/d2l/le/content/{org_unit_id}/Home")
+            return
+        LOG.info("No master course or section found for %s; trying the course selector.", course_code)
     button = first_matching_locator(page, COURSE_SELECTOR_BUTTON_CANDIDATES)
     if not button:
         LOG.info("Course selector button not found on %s.", page.url)

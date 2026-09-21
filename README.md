@@ -62,6 +62,17 @@ Every downloaded file is saved flat into the output folder, named by course
 code and converted to PDF if it wasn't one already (e.g. `Syllabi/CSE201.pdf`,
 `Syllabi/MATH150.pdf`) — see the Word/docx2pdf note above.
 
+### Bare course codes (no `--requester`)
+
+An entry that is just a department and number (`psyc 4063`, `BIOL-1334`) names
+no term or section. The script uses that course's master course, looked up in
+your account's enrollments: `PSYC_4063_ON_MC`,
+else `PSYC_4063_TR_MC`, else the most recent section of the course (the
+highest-numbered dated offering, ignoring "do not use" copies). It then opens
+that course directly, without the course selector. The file is named by what you
+typed (`psyc_4063.pdf`). Entries that name a specific course (a year, section,
+or full course code) are searched for as before.
+
 ### Manual fallback
 
 Brightspace themes vary by school, so if a step can't be automated (course
