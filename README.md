@@ -111,8 +111,9 @@ whole enrollment list (about a minute), once per run.
 
 When no syllabus is found, the summary says why: no matching course or master
 course (naming the codes it looked for), or the course it did pick had no
-syllabus among its N content topics, or its syllabus topic couldn't be
-downloaded.
+syllabus link in its module descriptions or among its N searchable content
+topics (noting any topic types the search doesn't read), or its syllabus topic
+couldn't be downloaded.
 
 It only ever looks in the one course it picked, because students expect the
 syllabus from their own exact course: if that course has no syllabus, the

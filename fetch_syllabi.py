@@ -297,9 +297,14 @@ def find_syllabus_via_api(
         )
     ]
     if not topics:
-        _search_failure_reason[org_unit_id] = "its content table of contents lists no topics"
+        _search_failure_reason[org_unit_id] = (
+            "its content table of contents lists no topics, and no module description links to a syllabus"
+        )
     else:
-        reason = f"none of its {len(topics) - len(unsearched)} searchable content topics is, or links to, a syllabus"
+        reason = (
+            f"no module description links to a syllabus, and none of its {len(topics) - len(unsearched)} "
+            "searchable content topics is, or links to, one"
+        )
         if unsearched:
             types = sorted({topic.get("TypeIdentifier") or "unknown" for topic in unsearched})
             reason += f"; its {len(unsearched)} topics of type {', '.join(types)} aren't searched"
