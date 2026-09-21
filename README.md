@@ -101,6 +101,13 @@ lists the candidates; put the year in the entry (`2024 PSYC 3063`) to pick one.
 summary. A real student's log normally holds only their own section(s), so
 this mostly comes up with staff/admin accounts, who are enrolled everywhere.
 
+If an entry matches nothing in their log at all, it falls back to the course's
+master course: the bare course code from the entry plus `ON MC` (`PSYC 4063`
+-> `PSYC_4063_ON_MC`), exact match only, searched in *your* account's
+enrollments since a student's log won't hold master courses. The summary flags
+such results as coming from the master course, and the first lookup scans your
+whole enrollment list (about a minute), once per run.
+
 It only ever looks in the one course it picked, because students expect the
 syllabus from their own exact course: if that course has no syllabus, the
 entry is reported as failed. Pass `--allow-other-sections` to instead fall

@@ -28,6 +28,7 @@ import logging
 import re
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -517,12 +518,52 @@ class AmbiguousCourse(Exception):
     pass
 
 
-def match_enrollment(description: str, enrollments: list[dict], guess_newest: bool = False) -> list[dict]:
+BARE_COURSE_CODE_RE = re.compile(r"([A-Za-z]{2,5})[\s_-]*(\d{3,4})")
+
+
+def find_master_course(
+    context: BrowserContext, base_url: str, api_versions: dict[str, str], description: str
+) -> list[dict]:
+    """The master course ("PSYC 4063 ON - ...", code PSYC_4063_ON_MC) for the
+    bare course code in a description, for when the person's own enrollment
+    log has no match. A student's log won't hold master courses, so this
+    searches the logged-in account's enrollments (an admin is enrolled in
+    them). Only an exact code match counts, so "..._ON_MC_DNU" copies don't.
+    Each result is flagged with "_master" so the summary can say so."""
+    bare = BARE_COURSE_CODE_RE.search(description)
+    lp_version = api_versions.get("lp")
+    if not bare or not lp_version:
+        return []
+    wanted = normalize_code(f"{bare.group(1)} {bare.group(2)} ON MC")
+    try:
+        enrollments = _all_course_enrollments(context, base_url, lp_version)
+    except Exception:  # noqa: BLE001 - best-effort
+        LOG.debug("Couldn't list the logged-in account's enrollments.", exc_info=True)
+        return []
+    found = [
+        {"Id": org_unit_id, "Code": code, "Name": name, "_master": True}
+        for org_unit_id, code, name in enrollments
+        if normalize_code(code) == wanted
+    ]
+    if found:
+        LOG.info("No match in their enrollment log; found the master course %s.", found[0]["Code"])
+    else:
+        LOG.info("No match in their enrollment log, and no master course %s_%s_ON_MC either.", *bare.groups())
+    return sorted(found, key=lambda org_unit: org_unit["Id"], reverse=True)
+
+
+def match_enrollment(
+    description: str,
+    enrollments: list[dict],
+    guess_newest: bool = False,
+    fallback: Callable[[], list[dict]] | None = None,
+) -> list[dict]:
     """Fuzzy-match a loosely-formatted course description (as sent by
     whoever is requesting the syllabus) against a user's real enrollment
     list, tolerating different separators/casing/extra words. Returns the
     courses to try, best first (empty if nothing matched or it was skipped).
-    Raises AmbiguousCourse if several courses match and there's no one to ask
+    If nothing matches at all, returns whatever `fallback` finds. Raises
+    AmbiguousCourse if several courses match and there's no one to ask
     (unless guess_newest is set)."""
     needle = normalize_code(description)
     if not needle:
@@ -545,6 +586,8 @@ def match_enrollment(description: str, enrollments: list[dict], guess_newest: bo
         tokens = [t for t in tokens if t]
         if len(tokens) > 1:
             matches = matches_all(*tokens)
+    if not matches and fallback is not None:
+        return fallback()
     if len(matches) <= 1:
         return matches
 
@@ -622,21 +665,26 @@ def run_for_requester(
         LOG.info("--- %s ---", description)
         try:
             try:
-                candidates = match_enrollment(description, enrollments, guess_newest=guess_newest)
+                candidates = match_enrollment(
+                    description, enrollments, guess_newest=guess_newest,
+                    fallback=lambda: find_master_course(context, base_url, api_versions, description),
+                )
             except AmbiguousCourse as exc:
                 LOG.error("%s", exc)
                 results[description] = f"FAILED: {exc}"
                 continue
             if not candidates:
                 LOG.error("No enrollment matched %r.", description)
-                results[description] = "FAILED: no matching course in their enrollment log"
+                results[description] = "FAILED: no matching course in their enrollment log, and no master course"
                 continue
 
             # Students expect the syllabus of their own exact course, so by
             # default only the best match is tried. Falling back to other
             # sections (a different term's syllabus) needs --allow-other-sections.
             notes: list[str] = []
-            if len(candidates) > 1:
+            if candidates[0].get("_master"):
+                notes.append("not in their enrollment log; used the master course")
+            elif len(candidates) > 1:
                 notes.append(f"guessed the newest of {len(candidates)} matching courses")
             api_result = None
             code = description
