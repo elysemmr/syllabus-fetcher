@@ -78,6 +78,30 @@ still handles the saving, naming, and PDF conversion automatically. This
 means you never have to manually "Save As" into the right folder with the
 right name yourself.
 
+### Fetching syllabi on someone else's behalf
+
+If you're pulling syllabi for someone who sent you a list of ~20 course
+codes/names that don't exactly match Brightspace's internal naming, use
+`--requester`:
+
+```bash
+python fetch_syllabi.py --requester theirusername --courses-file their_list.txt
+```
+
+This looks up `theirusername` in Brightspace, pulls their real enrollment
+log, and fuzzy-matches each entry in your list against it (tolerating
+different separators/casing/extra words, e.g. "PSYC 4063" will match
+`2024_US_PSYC_4063_70_ON_ONLN`), then downloads each matched course's
+syllabus -- entirely via the API, no clicking. If an entry matches more than
+one of their courses, it'll list the options and ask you which one they
+meant.
+
+**Requires an admin-level Brightspace account** (able to look up other
+users and their enrollments) -- this mode has no click-based fallback, so if
+the API can't resolve the username or find a syllabus for a matched course,
+that entry is just reported as failed in the summary rather than falling
+back to manual clicking.
+
 ### Session reuse
 
 Your logged-in session is kept in `.auth/` (gitignored) so you don't have to
