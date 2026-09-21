@@ -646,9 +646,15 @@ def find_master_course(
 
 
 def is_bare_course_code(text: str) -> bool:
-    """True for just a department and number ("PSYC 4063", "psyc_4063"),
-    with no year, section or other detail naming a specific course."""
-    return re.fullmatch(r"\s*[A-Za-z]{2,5}[\s_-]*\d{3,4}\s*", text) is not None
+    """True for a department and number, optionally with a trailing course
+    title ("PSYC 4063", "psyc_4063", "BBUS 2123 Macroeconomics") -- nothing
+    else that names a specific term, section, or year, which would show up
+    as extra digits elsewhere in the text."""
+    match = BARE_COURSE_CODE_RE.search(text)
+    if not match:
+        return False
+    remainder = text[:match.start()] + text[match.end():]
+    return not any(ch.isdigit() for ch in remainder)
 
 
 def find_default_course(
