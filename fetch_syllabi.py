@@ -190,7 +190,7 @@ def find_org_unit_id_via_api(
     lp_version = api_versions.get("lp")
     if not lp_version:
         return None
-    target = course_code.strip().lower()
+    target = course_code.strip().strip("_- ").lower()  # a code cut off at a "_" still matches
     try:
         enrollments = _all_course_enrollments(context, base_url, lp_version)
     except Exception:  # noqa: BLE001 - best-effort
