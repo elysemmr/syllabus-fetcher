@@ -232,6 +232,11 @@ def _iter_toc_topics(modules: list[dict], parents: tuple[str, ...] = ()):
         yield from _iter_toc_topics(module.get("Modules", []) or [], path)
 
 
+# Why the last syllabus search in each course (by org unit ID) came up empty,
+# for the summary. Filled in by find_syllabus_via_api.
+_search_failure_reason: dict[int, str] = {}
+
+
 def find_syllabus_via_api(
     context: BrowserContext, base_url: str, le_version: str, org_unit_id: int
 ) -> tuple[bytes, str] | None:
@@ -241,11 +246,31 @@ def find_syllabus_via_api(
         )
         if resp.status != 200:
             LOG.debug("Content TOC lookup returned HTTP %d: %s", resp.status, resp.text()[:500])
+            _search_failure_reason[org_unit_id] = f"its content table of contents returned HTTP {resp.status}"
             return None
         topics = list(_iter_toc_topics(resp.json().get("Modules", []) or []))
     except Exception:  # noqa: BLE001 - best-effort
         LOG.debug("Content TOC lookup failed.", exc_info=True)
+        _search_failure_reason[org_unit_id] = "its content table of contents couldn't be read"
         return None
+    # The search reads File, Link and HTML topics only; say so when others exist.
+    unsearched = [
+        topic for topic in topics
+        if not (
+            (topic.get("TypeIdentifier") or "").lower() == "file"
+            or "html" in (topic.get("TypeIdentifier") or "").lower()
+            or (topic.get("TypeIdentifier") or "").lower() == "link"
+        )
+    ]
+    if not topics:
+        _search_failure_reason[org_unit_id] = "its content table of contents lists no topics"
+    else:
+        reason = f"none of its {len(topics) - len(unsearched)} searchable content topics is, or links to, a syllabus"
+        if unsearched:
+            types = sorted({topic.get("TypeIdentifier") or "unknown" for topic in unsearched})
+            reason += f"; its {len(unsearched)} topics of type {', '.join(types)} aren't searched"
+        _search_failure_reason[org_unit_id] = reason
+    undownloadable: list[str] = []
 
     LOG.debug(
         "Content TOC has %d topics: %s",
@@ -269,6 +294,7 @@ def find_syllabus_via_api(
                 LOG.info("Syllabus is the topic %r (in %r).", topic.get("Title"), topic.get("ModulePath"))
                 return result
             LOG.debug("Fetching topic file for %r failed.", topic.get("Title"))
+            undownloadable.append(topic.get("Title") or "")
 
     # Slower path: a syllabus link buried inside a content page's body --
     # either an uploaded "File" topic (often an HTML page, like a "Course
@@ -336,6 +362,11 @@ def find_syllabus_via_api(
             LOG.debug("Fetching syllabus file %r failed.", href, exc_info=True)
             continue
 
+    if undownloadable:
+        _search_failure_reason[org_unit_id] = (
+            f"it has a syllabus topic ({', '.join(repr(title) for title in undownloadable)}) "
+            "but the file couldn't be downloaded"
+        )
     return None
 
 
@@ -518,38 +549,57 @@ class AmbiguousCourse(Exception):
     pass
 
 
+class CourseSkipped(Exception):
+    pass
+
+
 BARE_COURSE_CODE_RE = re.compile(r"([A-Za-z]{2,5})[\s_-]*(\d{3,4})")
+# Master course flavors, in the order they're tried: "PSYC 4063 ON - ..." is
+# the online master; "CSEC 4003 TR - ..." the one some programs use instead.
+MASTER_COURSE_SUFFIXES = ("ON", "TR")
+
+
+def master_course_codes(description: str) -> list[str]:
+    """The master course codes to look for, in order, from the bare course
+    code in a description: "PSYC 4063" -> ["PSYC_4063_ON_MC", "PSYC_4063_TR_MC"].
+    Empty if the description holds no course code."""
+    bare = BARE_COURSE_CODE_RE.search(description)
+    if not bare:
+        return []
+    return [f"{bare.group(1).upper()}_{bare.group(2)}_{suffix}_MC" for suffix in MASTER_COURSE_SUFFIXES]
 
 
 def find_master_course(
     context: BrowserContext, base_url: str, api_versions: dict[str, str], description: str
 ) -> list[dict]:
-    """The master course ("PSYC 4063 ON - ...", code PSYC_4063_ON_MC) for the
-    bare course code in a description, for when the person's own enrollment
-    log has no match. A student's log won't hold master courses, so this
-    searches the logged-in account's enrollments (an admin is enrolled in
-    them). Only an exact code match counts, so "..._ON_MC_DNU" copies don't.
-    Each result is flagged with "_master" so the summary can say so."""
-    bare = BARE_COURSE_CODE_RE.search(description)
+    """The master course for the bare course code in a description, for when
+    the person's own enrollment log has no match: the ON master if there is
+    one, otherwise the TR master. A student's log won't hold master courses,
+    so this searches the logged-in account's enrollments (an admin is
+    enrolled in them). Only an exact code match counts, so "..._ON_MC_DNU"
+    copies don't. Each result is flagged with "_master" so the summary can
+    say so."""
+    codes = master_course_codes(description)
     lp_version = api_versions.get("lp")
-    if not bare or not lp_version:
+    if not codes or not lp_version:
         return []
-    wanted = normalize_code(f"{bare.group(1)} {bare.group(2)} ON MC")
     try:
         enrollments = _all_course_enrollments(context, base_url, lp_version)
     except Exception:  # noqa: BLE001 - best-effort
         LOG.debug("Couldn't list the logged-in account's enrollments.", exc_info=True)
         return []
-    found = [
-        {"Id": org_unit_id, "Code": code, "Name": name, "_master": True}
-        for org_unit_id, code, name in enrollments
-        if normalize_code(code) == wanted
-    ]
-    if found:
-        LOG.info("No match in their enrollment log; found the master course %s.", found[0]["Code"])
-    else:
-        LOG.info("No match in their enrollment log, and no master course %s_%s_ON_MC either.", *bare.groups())
-    return sorted(found, key=lambda org_unit: org_unit["Id"], reverse=True)
+    for code in codes:
+        wanted = normalize_code(code)
+        found = [
+            {"Id": org_unit_id, "Code": found_code, "Name": name, "_master": True}
+            for org_unit_id, found_code, name in enrollments
+            if normalize_code(found_code) == wanted
+        ]
+        if found:
+            LOG.info("No match in their enrollment log; found the master course %s.", code)
+            return sorted(found, key=lambda org_unit: org_unit["Id"], reverse=True)
+        LOG.info("No master course %s either.", code)
+    return []
 
 
 def match_enrollment(
@@ -618,14 +668,13 @@ def match_enrollment(
         )
         return ordered
     if not choice:
-        return []
+        raise CourseSkipped(f"skipped '{description}' (no course chosen)")
     try:
         index = int(choice)
         if not (0 <= index < len(matches)):
             raise ValueError
     except ValueError:
-        LOG.error("Invalid selection, skipping '%s'.", description)
-        return []
+        raise CourseSkipped(f"skipped '{description}' (invalid selection {choice!r})")
     return [matches[index]]
 
 
@@ -669,13 +718,21 @@ def run_for_requester(
                     description, enrollments, guess_newest=guess_newest,
                     fallback=lambda: find_master_course(context, base_url, api_versions, description),
                 )
-            except AmbiguousCourse as exc:
+            except (AmbiguousCourse, CourseSkipped) as exc:
                 LOG.error("%s", exc)
                 results[description] = f"FAILED: {exc}"
                 continue
             if not candidates:
-                LOG.error("No enrollment matched %r.", description)
-                results[description] = "FAILED: no matching course in their enrollment log, and no master course"
+                masters = master_course_codes(description)
+                why = (
+                    f"no course matching '{description}' in their enrollment log, and no master course "
+                    f"{' or '.join(masters)}"
+                    if masters
+                    else f"no course matching '{description}' in their enrollment log, and no course code "
+                    "like 'PSYC 4063' in it to look up a master course by"
+                )
+                LOG.error("No syllabus for %r: %s.", description, why)
+                results[description] = f"FAILED: {why}"
                 continue
 
             # Students expect the syllabus of their own exact course, so by
@@ -699,8 +756,9 @@ def run_for_requester(
                     break
                 LOG.info("No syllabus found in %s.", code)
             if api_result is None:
-                LOG.error("Couldn't find/download a syllabus for %r in %s.", description, code)
-                results[description] = f"FAILED: no syllabus found in {code}"
+                why = _search_failure_reason.get(org_unit["Id"])
+                LOG.error("Couldn't find/download a syllabus for %r in %s%s.", description, code, f": {why}" if why else "")
+                results[description] = f"FAILED: no syllabus found in {code}" + (f" ({why})" if why else "")
                 continue
 
             data, filename = api_result

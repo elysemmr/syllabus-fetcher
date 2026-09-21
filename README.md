@@ -103,10 +103,16 @@ this mostly comes up with staff/admin accounts, who are enrolled everywhere.
 
 If an entry matches nothing in their log at all, it falls back to the course's
 master course: the bare course code from the entry plus `ON MC` (`PSYC 4063`
--> `PSYC_4063_ON_MC`), exact match only, searched in *your* account's
+-> `PSYC_4063_ON_MC`), or, if there's no `ON` master, `TR MC`
+(`CSEC_4003_TR_MC`). Exact match only, searched in *your* account's
 enrollments since a student's log won't hold master courses. The summary flags
 such results as coming from the master course, and the first lookup scans your
 whole enrollment list (about a minute), once per run.
+
+When no syllabus is found, the summary says why: no matching course or master
+course (naming the codes it looked for), or the course it did pick had no
+syllabus among its N content topics, or its syllabus topic couldn't be
+downloaded.
 
 It only ever looks in the one course it picked, because students expect the
 syllabus from their own exact course: if that course has no syllabus, the
