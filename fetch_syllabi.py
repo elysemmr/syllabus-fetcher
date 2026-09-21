@@ -109,6 +109,7 @@ def get_api_versions(context: BrowserContext, base_url: str) -> dict[str, str]:
     try:
         resp = context.request.get(f"{base_url.rstrip('/')}/d2l/api/versions/")
         if resp.status != 200:
+            LOG.debug("API versions lookup returned HTTP %d: %s", resp.status, resp.text()[:500])
             return versions
         for entry in resp.json():
             code = entry.get("ProductCode")
@@ -117,6 +118,7 @@ def get_api_versions(context: BrowserContext, base_url: str) -> dict[str, str]:
                 versions[code] = latest
     except Exception:  # noqa: BLE001 - best-effort
         LOG.debug("Couldn't fetch Brightspace API versions.", exc_info=True)
+    LOG.debug("Detected API versions: %s", versions)
     return versions
 
 
@@ -126,7 +128,8 @@ def find_org_unit_id(context: BrowserContext, base_url: str, lp_version: str, co
     enrollments (so this never depends on the course-selector UI)."""
     bookmark: str | None = None
     needle = course_code.lower()
-    for _ in range(20):  # safety cap on pagination
+    seen_codes: list[str] = []
+    for page_num in range(20):  # safety cap on pagination
         params = {"orgUnitTypeId": "3"}
         if bookmark:
             params["bookmark"] = bookmark
@@ -136,25 +139,38 @@ def find_org_unit_id(context: BrowserContext, base_url: str, lp_version: str, co
                 params=params,
             )
             if resp.status != 200:
+                LOG.debug(
+                    "Enrollment lookup (page %d) returned HTTP %d: %s",
+                    page_num, resp.status, resp.text()[:500],
+                )
                 return None
             data = resp.json()
         except Exception:  # noqa: BLE001 - best-effort
             LOG.debug("Enrollment lookup failed.", exc_info=True)
             return None
 
-        for item in data.get("Items", []):
+        items = data.get("Items", [])
+        LOG.debug("Enrollment lookup page %d: %d items.", page_num, len(items))
+        for item in items:
             org_unit = item.get("OrgUnit") or {}
             code = (org_unit.get("Code") or "").lower()
             name = (org_unit.get("Name") or "").lower()
             if not code and not name:
                 continue
+            seen_codes.append(f"Code={org_unit.get('Code')!r} Name={org_unit.get('Name')!r}")
             if needle in code or needle in name or code in needle or (name and name in needle):
+                LOG.debug("Matched course code to org unit %s (%s).", org_unit.get("Id"), seen_codes[-1])
                 return org_unit.get("Id")
 
         paging = data.get("PagingInfo") or {}
         if not paging.get("HasMoreItems"):
-            return None
+            break
         bookmark = paging.get("Bookmark")
+
+    LOG.debug(
+        "No enrollment matched course code %r. Enrollments seen (%d): %s",
+        course_code, len(seen_codes), seen_codes,
+    )
     return None
 
 
@@ -180,18 +196,27 @@ def find_syllabus_via_api(
             f"{base_url.rstrip('/')}/d2l/api/le/{le_version}/{org_unit_id}/content/toc"
         )
         if resp.status != 200:
+            LOG.debug("Content TOC lookup returned HTTP %d: %s", resp.status, resp.text()[:500])
             return None
         topics = list(_iter_toc_topics(resp.json().get("Modules", []) or []))
     except Exception:  # noqa: BLE001 - best-effort
         LOG.debug("Content TOC lookup failed.", exc_info=True)
         return None
 
+    LOG.debug(
+        "Content TOC has %d topics: %s",
+        len(topics),
+        [(t.get("Title"), t.get("TypeIdentifier")) for t in topics],
+    )
+
     # Fast path: a topic whose own title says "syllabus" (an uploaded file).
     for topic in topics:
         if SYLLABUS_RE.search(topic.get("Title") or ""):
+            LOG.debug("Topic title matches 'syllabus' directly: %r", topic.get("Title"))
             result = _fetch_topic_file(context, base_url, le_version, org_unit_id, topic)
             if result:
                 return result
+            LOG.debug("Fetching topic file for %r failed.", topic.get("Title"))
 
     # Slower path: a syllabus link buried inside an HTML content page.
     for topic in topics:
@@ -203,12 +228,18 @@ def find_syllabus_via_api(
             full_url = url if url.startswith("http") else f"{base_url.rstrip('/')}{url}"
             page_resp = context.request.get(full_url)
             if page_resp.status != 200:
+                LOG.debug(
+                    "Fetching topic page %r (%s) returned HTTP %d.",
+                    topic.get("Title"), full_url, page_resp.status,
+                )
                 continue
             html = page_resp.text()
         except Exception:  # noqa: BLE001 - best-effort
+            LOG.debug("Fetching topic page %r failed.", topic.get("Title"), exc_info=True)
             continue
         match = re.search(r'<a[^>]+href="([^"]+)"[^>]*>[^<]*syllabus[^<]*</a>', html, re.IGNORECASE)
         if not match:
+            LOG.debug("No syllabus link found in topic page %r.", topic.get("Title"))
             continue
         href = match.group(1)
         try:
@@ -216,7 +247,9 @@ def find_syllabus_via_api(
             file_resp = context.request.get(file_url)
             if file_resp.status == 200:
                 return file_resp.body(), _filename_from_response(file_resp, file_url)
+            LOG.debug("Fetching syllabus file %r returned HTTP %d.", file_url, file_resp.status)
         except Exception:  # noqa: BLE001 - best-effort
+            LOG.debug("Fetching syllabus file %r failed.", href, exc_info=True)
             continue
 
     return None
