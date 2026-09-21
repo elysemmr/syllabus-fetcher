@@ -1082,7 +1082,9 @@ def save_bytes(data: bytes, suggested_filename: str, output_dir: Path, course_co
     suffix = Path(suggested_filename).suffix or ""
     safe_code = sanitize_course_code(course_code)
     target = output_dir / f"{safe_code}{suffix}"
-    if target.exists():
+    # A Word file becomes "<code>.pdf" once converted, so an existing PDF of
+    # that name counts as taken too, or the conversion would overwrite it.
+    if target.exists() or target.with_suffix(".pdf").exists():
         target = output_dir / f"{safe_code}_2{suffix}"
     target.write_bytes(data)
     return target
