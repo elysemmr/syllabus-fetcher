@@ -178,28 +178,48 @@ def find_syllabus_via_api(
                 return result
             LOG.debug("Fetching topic file for %r failed.", topic.get("Title"))
 
-    # Slower path: a syllabus link buried inside an HTML content page.
+    # Slower path: a syllabus link buried inside a content page's body --
+    # either an uploaded "File" topic (often an HTML page, like a "Course
+    # Resources" checklist) or a "Link"/HTML topic reachable via its own Url.
     for topic in topics:
         type_id = (topic.get("TypeIdentifier") or "").lower()
-        url = topic.get("Url")
-        if not url or ("html" not in type_id and type_id != "link"):
-            continue
-        try:
-            full_url = url if url.startswith("http") else f"{base_url.rstrip('/')}{url}"
-            page_resp = context.request.get(full_url)
-            if page_resp.status != 200:
-                LOG.debug(
-                    "Fetching topic page %r (%s) returned HTTP %d.",
-                    topic.get("Title"), full_url, page_resp.status,
-                )
+        html: str | None = None
+
+        if type_id == "file":
+            file_result = _fetch_topic_file(context, base_url, le_version, org_unit_id, topic)
+            if not file_result:
+                LOG.debug("Couldn't fetch File-type topic %r.", topic.get("Title"))
                 continue
-            html = page_resp.text()
-        except Exception:  # noqa: BLE001 - best-effort
-            LOG.debug("Fetching topic page %r failed.", topic.get("Title"), exc_info=True)
+            content_bytes, _filename = file_result
+            try:
+                html = content_bytes.decode("utf-8", errors="ignore")
+            except Exception:  # noqa: BLE001 - best-effort
+                continue
+        elif "html" in type_id or type_id == "link":
+            url = topic.get("Url")
+            if not url:
+                continue
+            try:
+                full_url = url if url.startswith("http") else f"{base_url.rstrip('/')}{url}"
+                page_resp = context.request.get(full_url)
+                if page_resp.status != 200:
+                    LOG.debug(
+                        "Fetching topic page %r (%s) returned HTTP %d.",
+                        topic.get("Title"), full_url, page_resp.status,
+                    )
+                    continue
+                html = page_resp.text()
+            except Exception:  # noqa: BLE001 - best-effort
+                LOG.debug("Fetching topic page %r failed.", topic.get("Title"), exc_info=True)
+                continue
+        else:
+            continue
+
+        if not html:
             continue
         match = re.search(r'<a[^>]+href="([^"]+)"[^>]*>[^<]*syllabus[^<]*</a>', html, re.IGNORECASE)
         if not match:
-            LOG.debug("No syllabus link found in topic page %r.", topic.get("Title"))
+            LOG.debug("No syllabus link found in topic %r.", topic.get("Title"))
             continue
         href = match.group(1)
         try:
