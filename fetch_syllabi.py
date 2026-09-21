@@ -240,15 +240,20 @@ def _fetch_topic_file(
 ) -> tuple[bytes, str] | None:
     topic_id = topic.get("Id")
     if topic_id is None:
+        LOG.debug("Topic %r has no Id, can't fetch its file.", topic.get("Title"))
         return None
+    url = f"{base_url.rstrip('/')}/d2l/api/le/{le_version}/{org_unit_id}/content/topics/{topic_id}/file"
     try:
-        resp = context.request.get(
-            f"{base_url.rstrip('/')}/d2l/api/le/{le_version}/{org_unit_id}/content/topics/{topic_id}/file"
-        )
+        resp = context.request.get(url)
         if resp.status != 200:
+            LOG.debug(
+                "Fetching topic file %r (%s) returned HTTP %d: %s",
+                topic.get("Title"), url, resp.status, resp.text()[:300],
+            )
             return None
         return resp.body(), _filename_from_response(resp, topic.get("Title") or "syllabus.pdf")
     except Exception:  # noqa: BLE001 - best-effort
+        LOG.debug("Fetching topic file %r (%s) raised an exception.", topic.get("Title"), url, exc_info=True)
         return None
 
 
