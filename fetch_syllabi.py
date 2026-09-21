@@ -12,6 +12,10 @@ Usage:
     python fetch_syllabi.py --courses CSE201,MATH150,ENGL101
     python fetch_syllabi.py --courses-file courses.txt --output-dir ~/Desktop/Syllabi
 
+    # Fetching on behalf of someone else, from a loosely-formatted list they
+    # sent you (requires an admin-level Brightspace account):
+    python fetch_syllabi.py --requester jsmith123 --courses-file their_list.txt
+
 See README.md for one-time setup (installing Playwright's browser, filling
 in config.json).
 """
@@ -283,6 +287,163 @@ def try_api_auto_download(
     except Exception:  # noqa: BLE001 - this whole path is best-effort
         LOG.debug("API auto-download attempt failed.", exc_info=True)
         return None
+
+
+def normalize_code(s: str | None) -> str:
+    """Strip everything but letters/digits and uppercase, so 'PSYC 4063',
+    'psyc-4063', and '..._PSYC_4063_...' all compare equal."""
+    return re.sub(r"[^A-Za-z0-9]", "", s or "").upper()
+
+
+def find_user_id_by_username(context: BrowserContext, base_url: str, lp_version: str, username: str) -> int | None:
+    """Look up a Brightspace user's internal ID from their username, via the
+    admin-level user search API."""
+    try:
+        resp = context.request.get(
+            f"{base_url.rstrip('/')}/d2l/api/lp/{lp_version}/users/",
+            params={"userName": username},
+        )
+        if resp.status != 200:
+            LOG.debug("User lookup for %r returned HTTP %d: %s", username, resp.status, resp.text()[:500])
+            return None
+        data = resp.json()
+    except Exception:  # noqa: BLE001 - best-effort
+        LOG.debug("User lookup for %r failed.", username, exc_info=True)
+        return None
+
+    # Different API versions return either a single object or a list.
+    if isinstance(data, list):
+        if not data:
+            LOG.debug("No user found for username %r.", username)
+            return None
+        data = data[0]
+    user_id = data.get("UserId") or data.get("Identifier")
+    LOG.debug("Resolved username %r to user ID %s.", username, user_id)
+    return user_id
+
+
+def get_user_enrollments(context: BrowserContext, base_url: str, lp_version: str, user_id: int) -> list[dict]:
+    """Fetch every course (org unit) a given user is enrolled in, as a list
+    of {"Id", "Code", "Name"} dicts, via the admin-level enrollments API."""
+    enrollments: list[dict] = []
+    bookmark: str | None = None
+    for page_num in range(20):  # safety cap on pagination
+        params = {"bookmark": bookmark} if bookmark else {}
+        try:
+            resp = context.request.get(
+                f"{base_url.rstrip('/')}/d2l/api/lp/{lp_version}/enrollments/users/{user_id}/orgUnits/",
+                params=params,
+            )
+            if resp.status != 200:
+                LOG.debug(
+                    "Enrollment fetch for user %s (page %d) returned HTTP %d: %s",
+                    user_id, page_num, resp.status, resp.text()[:500],
+                )
+                break
+            data = resp.json()
+        except Exception:  # noqa: BLE001 - best-effort
+            LOG.debug("Enrollment fetch for user %s failed.", user_id, exc_info=True)
+            break
+
+        for item in data.get("Items", []):
+            org_unit = item.get("OrgUnit") or {}
+            if org_unit.get("Id"):
+                enrollments.append(org_unit)
+
+        paging = data.get("PagingInfo") or {}
+        if not paging.get("HasMoreItems"):
+            break
+        bookmark = paging.get("Bookmark")
+
+    LOG.debug("Fetched %d course enrollments for user %s.", len(enrollments), user_id)
+    return enrollments
+
+
+def match_enrollment(description: str, enrollments: list[dict]) -> dict | None:
+    """Fuzzy-match a loosely-formatted course description (as sent by
+    whoever is requesting the syllabus) against a user's real enrollment
+    list, tolerating different separators/casing/extra words."""
+    needle = normalize_code(description)
+    if not needle:
+        return None
+    matches = [
+        org_unit for org_unit in enrollments
+        if needle in normalize_code(org_unit.get("Code")) or needle in normalize_code(org_unit.get("Name"))
+    ]
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+
+    print(f"\n'{description}' matched {len(matches)} courses in their enrollment log:")
+    for i, org_unit in enumerate(matches):
+        print(f"  [{i}] {org_unit.get('Name')} ({org_unit.get('Code')})")
+    choice = input("Which one did they mean? Enter a number (or press Enter to skip): ").strip()
+    if not choice:
+        return None
+    try:
+        index = int(choice)
+        if not (0 <= index < len(matches)):
+            raise ValueError
+    except ValueError:
+        LOG.error("Invalid selection, skipping '%s'.", description)
+        return None
+    return matches[index]
+
+
+def run_for_requester(
+    context: BrowserContext,
+    base_url: str,
+    api_versions: dict[str, str],
+    username: str,
+    descriptions: list[str],
+    output_dir: Path,
+) -> dict[str, str]:
+    """Resolve a batch of loosely-formatted course descriptions against a
+    specific person's real enrollment log (by username), then download each
+    matched course's syllabus -- entirely via Brightspace's API, using the
+    logged-in admin account's own read access. No browser clicking."""
+    results: dict[str, str] = {}
+
+    lp_version = api_versions.get("lp")
+    le_version = api_versions.get("le")
+    if not lp_version or not le_version:
+        LOG.error("Brightspace API isn't reachable -- --requester mode needs it and can't fall back to clicking.")
+        return {d: "FAILED: Brightspace API not reachable" for d in descriptions}
+
+    user_id = find_user_id_by_username(context, base_url, lp_version, username)
+    if user_id is None:
+        LOG.error("Couldn't find a Brightspace user with username %r.", username)
+        return {d: f"FAILED: user {username!r} not found" for d in descriptions}
+
+    enrollments = get_user_enrollments(context, base_url, lp_version, user_id)
+    LOG.info("Found %d courses in %s's enrollment log.", len(enrollments), username)
+    if not enrollments:
+        return {d: f"FAILED: no enrollments found for {username!r}" for d in descriptions}
+
+    for description in descriptions:
+        LOG.info("--- %s ---", description)
+        org_unit = match_enrollment(description, enrollments)
+        if org_unit is None:
+            LOG.error("No enrollment matched %r.", description)
+            results[description] = "FAILED: no matching course in their enrollment log"
+            continue
+
+        code = org_unit.get("Code") or description
+        LOG.info("Matched %r -> %s (%s)", description, org_unit.get("Name"), code)
+        api_result = try_api_auto_download(context, base_url, api_versions, org_unit["Id"])
+        if api_result is None:
+            LOG.error("Couldn't find/download a syllabus for %s via the API.", code)
+            results[description] = f"FAILED: syllabus not found for {code}"
+            continue
+
+        data, filename = api_result
+        saved_path = save_bytes(data, filename, output_dir, code)
+        saved_path = ensure_pdf(saved_path)
+        LOG.info("Saved %s -> %s", code, saved_path)
+        results[description] = f"OK: {saved_path}"
+
+    return results
 
 
 def load_config(path: Path) -> dict:
@@ -634,6 +795,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--courses", help="Comma-separated course codes, e.g. CSE201,MATH150")
     parser.add_argument("--courses-file", help="Path to a file with one course code per line")
+    parser.add_argument(
+        "--requester",
+        help="Brightspace username of the person the syllabi are for. When set, --courses/"
+        "--courses-file entries are treated as loosely-formatted descriptions to fuzzy-match "
+        "against that person's own enrollment log (requires admin-level API access), instead "
+        "of course codes to search for in your own enrolled courses.",
+    )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config.json")
     parser.add_argument("--output-dir", help="Where to save syllabi (default: ~/Desktop/Syllabi)")
     parser.add_argument(
@@ -685,20 +853,25 @@ def main(argv: list[str] | None = None) -> int:
         else:
             LOG.info("Brightspace API not reachable -- falling back to click-based automation.")
 
-        for course_code in course_codes:
-            LOG.info("--- %s ---", course_code)
-            try:
-                saved_path = process_course(page, course_code, output_dir, config["base_url"], api_versions)
-                LOG.info("Saved %s -> %s", course_code, saved_path)
-                results[course_code] = f"OK: {saved_path}"
-            except (CourseNotFound, SyllabusNotFound) as exc:
-                LOG.error("%s: %s", course_code, exc)
-                results[course_code] = f"FAILED: {exc}"
-            except KeyboardInterrupt:
-                raise
-            except Exception as exc:  # noqa: BLE001 - report and move to next course
-                LOG.exception("Unexpected error on %s", course_code)
-                results[course_code] = f"ERROR: {exc}"
+        if args.requester:
+            results = run_for_requester(
+                context, config["base_url"], api_versions, args.requester, course_codes, output_dir
+            )
+        else:
+            for course_code in course_codes:
+                LOG.info("--- %s ---", course_code)
+                try:
+                    saved_path = process_course(page, course_code, output_dir, config["base_url"], api_versions)
+                    LOG.info("Saved %s -> %s", course_code, saved_path)
+                    results[course_code] = f"OK: {saved_path}"
+                except (CourseNotFound, SyllabusNotFound) as exc:
+                    LOG.error("%s: %s", course_code, exc)
+                    results[course_code] = f"FAILED: {exc}"
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - report and move to next course
+                    LOG.exception("Unexpected error on %s", course_code)
+                    results[course_code] = f"ERROR: {exc}"
 
         context.close()
 
